@@ -1,0 +1,34 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(powershell -NoProfile -Command '[System.Text.Encoding]::ASCII.GetString\\([System.IO.File]::ReadAllBytes\\('\\\\''C:\\\\Games\\\\KQ8\\\\3DfxSpl.dll'\\\\''\\)\\) -split '\\\\''[^\\\\x20-\\\\x7E]+'\\\\'' | Where-Object { $_.Length -gt 3 -and $_ -match '\\\\''gr[A-Z]|Glide|glide|3dfx|texture|render'\\\\'' } | Sort-Object -Unique | Select-Object -First 60')",
+      "Bash(powershell -NoProfile -Command '[System.Text.Encoding]::ASCII.GetString\\([System.IO.File]::ReadAllBytes\\('\\\\''C:\\\\Games\\\\KQ8\\\\3DfxSpl2.dll'\\\\''\\)\\) -split '\\\\''[^\\\\x20-\\\\x7E]+'\\\\'' | Where-Object { $_.Length -gt 3 -and $_ -match '\\\\''gr[A-Z]|Glide|glide|3dfx|texture|render|gu[A-Z]'\\\\'' } | Sort-Object -Unique | Select-Object -First 60')",
+      "Bash(powershell -NoProfile -Command '[System.Text.Encoding]::ASCII.GetString\\([System.IO.File]::ReadAllBytes\\('\\\\''C:\\\\Games\\\\KQ8\\\\3DfxSpl3.dll'\\\\''\\)\\) -split '\\\\''[^\\\\x20-\\\\x7E]+'\\\\'' | Where-Object { $_.Length -gt 3 -and $_ -match '\\\\''gr[A-Z]|Glide|glide|3dfx|texture|render|gu[A-Z]'\\\\'' } | Sort-Object -Unique | Select-Object -First 60')",
+      "Bash(powershell -NoProfile -Command '[System.Text.Encoding]::ASCII.GetString\\([System.IO.File]::ReadAllBytes\\('\\\\''C:\\\\Games\\\\KQ8\\\\Sh34w32.dll'\\\\''\\)\\) -split '\\\\''[^\\\\x20-\\\\x7E]+'\\\\'' | Where-Object { $_.Length -gt 3 -and $_ -match '\\\\''GMode|3DfxSpl|D3D|DDraw|display|render|Glide|Software|Hardware'\\\\'' } | Sort-Object -Unique | Select-Object -First 40')",
+      "Bash(powershell -NoProfile -Command '& { $base = '\\\\''C:\\\\Program Files \\(x86\\)\\\\GOG Galaxy\\\\Games\\\\Kings Quest 8\\\\Kings Quest 8'\\\\''; foreach \\($f in @\\('\\\\''Mask.exe'\\\\'','\\\\''Sh34w32.dll'\\\\'','\\\\''Ha312w32.dll'\\\\''\\)\\) { Write-Output \"=== $f ===\"; $bytes = [System.IO.File]::ReadAllBytes\\(\"$base\\\\$f\"\\); $text = [System.Text.Encoding]::ASCII.GetString\\($bytes\\); $matches = [regex]::Matches\\($text, '\\\\''glide[23]?x?\\\\.dll|grSst|grDraw|grTex|grBuffer|grGlide|grAlpha|grColor|grDepth|grFog|grClip|GMode|3Dfx|D3D|DDraw|ddraw|direct|opengl'\\\\'', '\\\\''IgnoreCase'\\\\''\\); $matches | ForEach-Object { $_.Value } | Sort-Object -Unique } }')",
+      "Bash(python3 -c ':*)",
+      "Bash(node -e ':*)",
+      "Bash(powershell -NoProfile -Command 'Get-WinEvent -FilterHashtable @{LogName='\\\\''Application'\\\\''; Level=2; StartTime=\\(Get-Date\\).AddMinutes\\(-10\\)} -ErrorAction SilentlyContinue | Where-Object { $_.Message -match '\\\\''Mask|mask|glide|nglide|3dfx'\\\\'' } | Select-Object -First 5 TimeCreated, Message | Format-List')",
+      "Bash(powershell -NoProfile -ExecutionPolicy Bypass -File \"C:/Users/damia/AppData/Local/Temp/check_crash.ps1\")",
+      "Bash(./Mask.exe)",
+      "Bash(echo \"Exit code: $?\")",
+      "Bash(cmd //c \"Mask.exe\")",
+      "Bash(cmd //c \"cd /d \\\\\"C:\\\\Program Files \\(x86\\)\\\\GOG Galaxy\\\\Games\\\\Kings Quest 8\\\\Kings Quest 8\\\\\" && Mask.exe\")",
+      "Bash(cmd //c \"cd /d \\\\\"C:\\\\\\\\Program Files \\(x86\\)\\\\\\\\GOG Galaxy\\\\\\\\Games\\\\\\\\Kings Quest 8\\\\\\\\Kings Quest 8\\\\\" && Mask.exe\")",
+      "Bash(powershell -NoProfile -Command \"Start-Process -FilePath 'C:\\\\Program Files \\(x86\\)\\\\GOG Galaxy\\\\Games\\\\Kings Quest 8\\\\Kings Quest 8\\\\Mask.exe' -WorkingDirectory 'C:\\\\Program Files \\(x86\\)\\\\GOG Galaxy\\\\Games\\\\Kings Quest 8\\\\Kings Quest 8' -Wait -PassThru | Select-Object ExitCode\")",
+      "Bash(powershell -NoProfile -Command \"Get-ItemProperty -Path 'HKCU:\\\\Software\\\\Zeus Software\\\\nGlide' -ErrorAction SilentlyContinue | Format-List\")",
+      "Bash(powershell -NoProfile -Command \"Get-ItemProperty -Path 'HKLM:\\\\Software\\\\Zeus Software\\\\nGlide' -ErrorAction SilentlyContinue | Format-List; Get-ItemProperty -Path 'HKLM:\\\\Software\\\\WOW6432Node\\\\Zeus Software\\\\nGlide' -ErrorAction SilentlyContinue | Format-List\")",
+      "Bash(powershell -NoProfile -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\VC\\\\Tools\\\\MSVC\\\\14.50.35717\\\\bin\\\\Hostx64\\\\x86\\\\dumpbin.exe' /EXPORTS 'C:\\\\Program Files \\(x86\\)\\\\GOG Galaxy\\\\Games\\\\Kings Quest 8\\\\Kings Quest 8\\\\glide2x.dll'\")",
+      "Bash(cmd //c build.bat)",
+      "Bash(cmd //c \"cd /d E:\\\\Projects\\\\DirectGlide && build.bat\")",
+      "Bash(cmd //c \"E:\\\\Projects\\\\DirectGlide\\\\build.bat\")",
+      "Bash(ls -la E:/Projects/DirectGlide/src/*.obj)",
+      "Bash(file E:/Projects/DirectGlide/src/*.obj)",
+      "Bash(\"/c/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/bin/Hostx64/x86/link.exe\" /nologo /DLL /OUT:build/glide2x.dll /DEF:glide2x.def /LIBPATH:\"C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.50.35717/lib/x86\" /LIBPATH:\"C:/Program Files \\(x86\\)/Windows Kits/10/Lib/10.0.26100.0/ucrt/x86\" /LIBPATH:\"C:/Program Files \\(x86\\)/Windows Kits/10/Lib/10.0.26100.0/um/x86\" src/dllmain.obj src/log.obj src/glide_exports.obj kernel32.lib user32.lib)",
+      "Bash(powershell -NoProfile -Command \"& 'C:\\\\Program Files\\\\Microsoft Visual Studio\\\\18\\\\Community\\\\VC\\\\Tools\\\\MSVC\\\\14.50.35717\\\\bin\\\\Hostx64\\\\x86\\\\dumpbin.exe' /EXPORTS 'E:\\\\Projects\\\\DirectGlide\\\\build\\\\glide2x.dll'\")",
+      "Bash(powershell -NoProfile -Command \"Get-Process Mask -ErrorAction SilentlyContinue | Select-Object Id, ProcessName\")",
+      "Bash(powershell -NoProfile -Command \"Stop-Process -Name Mask -Force -ErrorAction SilentlyContinue\")",
+      "Bash(powershell -NoProfile -Command \"Get-WmiObject Win32_VideoController | Select-Object Name, DriverVersion, AdapterRAM | Format-List\")"
+    ]
+  }
+}
