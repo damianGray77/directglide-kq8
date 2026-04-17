@@ -8,22 +8,32 @@
 #include "glide2x.h"
 #include <d3d11.h>
 
-#define DG_TEX_CACHE_SIZE 32768
+#define DG_TEX_BUCKET_COUNT 16384  /* number of hash buckets (head-of-list each) */
 
-typedef struct {
+typedef struct DGTexCacheEntry DGTexCacheEntry;
+struct DGTexCacheEntry {
     FxU32 addr;           /* TMU memory address (key) */
     int   width, height;
     GrTextureFormat_t fmt;
     ID3D11Texture2D* tex;
     ID3D11ShaderResourceView* srv;
     int   valid;
-    int   isPalettized;   /* Was this created with a palette? */
-    /* Deferred decode: raw data stored for palettized textures uploaded before palette */
-    void* rawData;        /* Copy of raw texture data (NULL if already decoded) */
+    int   isPalettized;
+    void* rawData;
     int   rawDataSize;
+    FxU32 paletteHash;
+    FxU32 dataHash;
     GrLOD_t storedSmallLod, storedLargeLod;
     GrAspectRatio_t storedAspect;
-} DGTexCacheEntry;
+    DGTexCacheEntry* next;   /* chained hash bucket linked list */
+    unsigned lastUsedFrame;  /* for LRU eviction */
+};
+
+/* Bump this each frame; texture entries older than MAX_ENTRY_AGE are evictable */
+void dg_tex_tick_frame(void);
+
+/* Fallback SRV for cache misses — deterministic visible indicator */
+ID3D11ShaderResourceView* dg_tex_get_miss_srv(void);
 
 void dg_tex_init(void);
 void dg_tex_shutdown(void);

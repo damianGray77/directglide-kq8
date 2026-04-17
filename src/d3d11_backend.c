@@ -60,6 +60,64 @@ static const char* s_lfbShaderSrc =
     "    return c;\n"
     "}\n";
 
+/* Final blit: offscreen game RT -> swap chain back buffer with aspect preservation */
+static const char* s_blitShaderSrc =
+    "cbuffer BlitCB : register(b0) {\n"
+    "    float4 rect; /* x0, y0, x1, y1 in NDC */\n"
+    "    float4 texSize; /* gameW, gameH, 1/gameW, 1/gameH */\n"
+    "};\n"
+    "Texture2D    tex : register(t0);\n"
+    "SamplerState smp : register(s0);\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+    "VSOut VSMain(uint id : SV_VertexID) {\n"
+    "    VSOut o;\n"
+    "    /* Generate 4 corners (0,0), (1,0), (0,1), (1,1) for triangle strip quad */\n"
+    "    float2 uv = float2((id & 1) ? 1.0 : 0.0, (id & 2) ? 1.0 : 0.0);\n"
+    "    o.uv = uv;\n"
+    "    o.pos = float4(lerp(rect.x, rect.z, uv.x), lerp(rect.w, rect.y, uv.y), 0, 1);\n"
+    "    return o;\n"
+    "}\n"
+    "float4 PSMain(VSOut i) : SV_TARGET {\n"
+    "    /* Sharp bilinear: flat plateau in middle of each texel (nearest-neighbor),\n"
+    "     * blend only within one dest-pixel width of the texel boundary. */\n"
+    "    float2 pixel = i.uv * texSize.xy;\n"
+    "    float2 f = frac(pixel);\n"
+    "    float2 tpp = max(fwidth(pixel), 0.0001);\n"
+    "    /* Offset from texel center, in [-0.5, 0.5] */\n"
+    "    float2 offset = f - 0.5;\n"
+    "    /* snap_range: distance from center where we stay at center (nearest-neighbor region) */\n"
+    "    float2 snapRange = 0.5 - tpp * 0.5;\n"
+    "    /* Only the excess over snapRange generates a ramp */\n"
+    "    float2 excess = sign(offset) * max(abs(offset) - snapRange, 0.0);\n"
+    "    /* Scale excess to reach -0.5..0.5 at texel boundaries */\n"
+    "    float2 scaled = clamp(excess / (tpp * 0.5), -1.0, 1.0);\n"
+    "    float2 fSnapped = 0.5 + scaled * 0.5;\n"
+    "    float2 uvSharp = (floor(pixel) + fSnapped) * texSize.zw;\n"
+    "    return tex.Sample(smp, uvSharp);\n"
+    "}\n";
+
+/* SSAA downsample: linear sample at the center of each dest pixel's source
+ * footprint. For SSAA=2, the dest UV's linear sample averages exactly 4
+ * source texels (a 2x2 box filter). */
+static const char* s_downsampleShaderSrc =
+    "cbuffer DSCB : register(b0) {\n"
+    "    float4 dsRect;     /* unused — matches blitCB layout */\n"
+    "    float4 srcSize;    /* w, h, 1/w, 1/h */\n"
+    "};\n"
+    "Texture2D    src : register(t0);\n"
+    "SamplerState lin : register(s0);\n"
+    "struct VSOut { float4 pos : SV_POSITION; float2 uv : TEXCOORD0; };\n"
+    "VSOut VSMain(uint id : SV_VertexID) {\n"
+    "    VSOut o;\n"
+    "    float2 uv = float2((id & 1) ? 1.0 : 0.0, (id & 2) ? 1.0 : 0.0);\n"
+    "    o.uv = uv;\n"
+    "    o.pos = float4(uv.x * 2.0 - 1.0, 1.0 - uv.y * 2.0, 0, 1);\n"
+    "    return o;\n"
+    "}\n"
+    "float4 PSMain(VSOut i) : SV_TARGET {\n"
+    "    return src.Sample(lin, i.uv);\n"
+    "}\n";
+
 /* 3D scene shader with combiner support */
 static const char* s_sceneShaderSrc =
     "cbuffer CB : register(b0) {\n"
@@ -77,6 +135,10 @@ static const char* s_sceneShaderSrc =
     "Texture2D    texMap : register(t0);\n"
     "SamplerState texSmp : register(s0);\n"
     "\n"
+    "cbuffer FogCB : register(b1) {\n"
+    "    float4 fogTable[16]; /* 64 floats — fog density per Glide index, 0..1 */\n"
+    "};\n"
+    "\n"
     "struct VSIn {\n"
     "    float2 pos   : POSITION;\n"
     "    float  depth : TEXCOORD3;\n"
@@ -86,16 +148,22 @@ static const char* s_sceneShaderSrc =
     "};\n"
     "\n"
     "struct PSIn {\n"
-    "    float4 pos   : SV_POSITION;\n"
-    "    float4 color : COLOR;\n"
-    "    float  oow   : OOW;\n"
-    "    float3 tmu0  : TEXCOORD0;\n"
+    "    float4        pos   : SV_POSITION;\n"
+    "    sample float4 color : COLOR;\n"
+    "    sample float  oow   : OOW;\n"
+    "    sample float3 tmu0  : TEXCOORD0;\n"
     "};\n"
     "\n"
     "PSIn VSMain(VSIn v) {\n"
     "    PSIn o;\n"
-    "    o.pos.x = v.pos.x * viewport.z * 2.0 - 1.0;\n"
-    "    o.pos.y = 1.0 - v.pos.y * viewport.w * 2.0;\n"
+    "    /* Snap to 1/16 pixel grid — mimics Voodoo's 4-bit subpixel precision. */\n"
+    "    float sx = floor(v.pos.x * 16.0 + 0.5) * (1.0/16.0);\n"
+    "    float sy = floor(v.pos.y * 16.0 + 0.5) * (1.0/16.0);\n"
+    "    /* Apply -0.5 offset to align Glide vertex coords with D3D11 pixel centers */\n"
+    "    float px = sx - 0.5;\n"
+    "    float py = sy - 0.5;\n"
+    "    o.pos.x = px * viewport.z * 2.0 - 1.0;\n"
+    "    o.pos.y = 1.0 - py * viewport.w * 2.0;\n"
     "    o.pos.z = v.depth;\n"
     "    o.pos.w = 1.0;\n"
     "    o.color = v.color;\n"
@@ -142,6 +210,8 @@ static const char* s_sceneShaderSrc =
     "    if (i.tmu0.z > 0.0000001) {\n"
     "        /* sow/oow gives texel coords in [0,256] range; normalize to [0,1] UV */\n"
     "        float2 uv = (i.tmu0.xy / i.tmu0.z) / 256.0;\n"
+    "        /* Sample() lets the sampler state control LOD + anisotropy from UV\n"
+    "         * derivatives. This is what actually enables aniso + mipmaps. */\n"
     "        texColor = texMap.Sample(texSmp, uv);\n"
     "    }\n"
     "\n"
@@ -213,10 +283,29 @@ static const char* s_sceneShaderSrc =
     "    if (atFunc == 1 && finalColor.a >= atRef) discard;\n"
     "    if (atFunc == 4 && finalColor.a <= atRef) discard;\n"
     "\n"
-    "    /* Fog disabled — needs correct fog factor calculation */\n"
-    "\n"
     "    finalColor = saturate(finalColor);\n"
-    "    /* (placeholder for fog) */\n"
+    "\n"
+    "    /* Glide fog: fogMode bits: 1=WITH_TABLE, 2=WITH_ITERATED_ALPHA, 4=MULT2, 8=ADD2.\n"
+    "     * Source selects the factor, MULT2/ADD2 change the blend combine. */\n"
+    "    int fogMode = fogAlphaChroma.x;\n"
+    "    int fogSrc  = fogMode & 3;\n"
+    "    if (fogSrc != 0) {\n"
+    "        float fogF = 0.0;\n"
+    "        if (fogSrc == 1) {\n"
+    "            float w = 1.0 / max(i.oow, 1e-6);\n"
+    "            float idx = log2(max(w, 1.0)) * 4.0;\n"
+    "            idx = clamp(idx, 0.0, 63.0);\n"
+    "            int   i0 = (int)floor(idx);\n"
+    "            int   i1 = min(i0 + 1, 63);\n"
+    "            float frac_= idx - (float)i0;\n"
+    "            float a = fogTable[i0 / 4][i0 & 3];\n"
+    "            float b = fogTable[i1 / 4][i1 & 3];\n"
+    "            fogF = lerp(a, b, frac_);\n"
+    "        } else {\n"
+    "            fogF = saturate(i.color.a);\n"
+    "        }\n"
+    "        finalColor.rgb = lerp(finalColor.rgb, fogColor.rgb, fogF);\n"
+    "    }\n"
     "    return finalColor;\n"
     "}\n";
 
@@ -248,6 +337,170 @@ static int compileShader(const char* src, const char* entry, const char* target,
 static int createDepthBuffer(void);
 static int createLfbResources(void);
 static int createScenePipeline(void);
+static int createBlitResources(void);
+static void blitGameToScreen(void);
+static void runAAPass(void);
+
+/* Compute the on-screen rect where the game is rendered (letterbox area) */
+static void getGameRect(int* destX, int* destY, int* destW, int* destH) {
+    float gameAsp = (float)g_dg.width / (float)g_dg.height;
+    float scrAsp = (float)g_dg.screenWidth / (float)g_dg.screenHeight;
+    if (scrAsp > gameAsp) {
+        *destH = g_dg.screenHeight;
+        *destW = (int)((float)g_dg.width * (float)g_dg.screenHeight / (float)g_dg.height);
+    } else {
+        *destW = g_dg.screenWidth;
+        *destH = (int)((float)g_dg.height * (float)g_dg.screenWidth / (float)g_dg.width);
+    }
+    *destX = (g_dg.screenWidth - *destW) / 2;
+    *destY = (g_dg.screenHeight - *destH) / 2;
+}
+
+/* Translate screen-space mouse (window-client) coords to game coords (640x480) */
+static LPARAM translateMouseLParam(LPARAM lParam) {
+    int destX, destY, destW, destH;
+    short winX = (short)(lParam & 0xFFFF);
+    short winY = (short)((lParam >> 16) & 0xFFFF);
+    int gameX, gameY;
+    getGameRect(&destX, &destY, &destW, &destH);
+    if (destW == 0 || destH == 0) return lParam;
+    gameX = (int)(((long)winX - destX) * (long)g_dg.width / (long)destW);
+    gameY = (int)(((long)winY - destY) * (long)g_dg.height / (long)destH);
+    /* Minimum gameX = 1, not 0. The LFB-flush HUD-detection hack probes the
+     * leftmost pixel column (x=0) to identify HUD bar extents; the cursor is
+     * the only game element that could reach x=0, so we keep it one pixel in. */
+    if (gameX < 1) gameX = 1; else if (gameX >= g_dg.width)  gameX = g_dg.width - 1;
+    if (gameY < 0) gameY = 0; else if (gameY >= g_dg.height) gameY = g_dg.height - 1;
+    return (LPARAM)((gameY & 0xFFFF) << 16) | (LPARAM)(gameX & 0xFFFF);
+}
+
+/* Our wrapper window proc: translate mouse coords, then forward */
+static LRESULT CALLBACK dgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (g_dg.isOpen) {
+        switch (msg) {
+            case WM_MOUSEMOVE:
+            case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
+            case WM_RBUTTONDOWN: case WM_RBUTTONUP: case WM_RBUTTONDBLCLK:
+            case WM_MBUTTONDOWN: case WM_MBUTTONUP: case WM_MBUTTONDBLCLK:
+                lParam = translateMouseLParam(lParam);
+                break;
+        }
+    }
+    if (g_dg.origWndProc)
+        return CallWindowProc(g_dg.origWndProc, hwnd, msg, wParam, lParam);
+    return DefWindowProc(hwnd, msg, wParam, lParam);
+}
+
+/* IAT hook: intercept GetCursorPos/SetCursorPos/ClipCursor */
+typedef BOOL (WINAPI *GetCursorPosFn)(LPPOINT);
+typedef BOOL (WINAPI *SetCursorPosFn)(int, int);
+typedef BOOL (WINAPI *ClipCursorFn)(const RECT*);
+typedef BOOL (WINAPI *ScreenToClientFn)(HWND, LPPOINT);
+static GetCursorPosFn s_origGetCursorPos = NULL;
+static SetCursorPosFn s_origSetCursorPos = NULL;
+static ClipCursorFn   s_origClipCursor   = NULL;
+static ScreenToClientFn s_origScreenToClient = NULL;
+
+/* Translate game coords -> screen coords */
+static void gameToScreen(int gx, int gy, int* sx, int* sy) {
+    int destX, destY, destW, destH;
+    getGameRect(&destX, &destY, &destW, &destH);
+    *sx = destX + gx * destW / g_dg.width;
+    *sy = destY + gy * destH / g_dg.height;
+}
+
+static BOOL WINAPI hookedSetCursorPos(int x, int y) {
+    if (!g_dg.isOpen) return s_origSetCursorPos ? s_origSetCursorPos(x, y) : SetCursorPos(x, y);
+    {
+        int sx, sy;
+        gameToScreen(x, y, &sx, &sy);
+        if (s_origSetCursorPos) return s_origSetCursorPos(sx, sy);
+        return SetCursorPos(sx, sy);
+    }
+}
+
+static BOOL WINAPI hookedClipCursor(const RECT* r) {
+    if (!r || !g_dg.isOpen)
+        return s_origClipCursor ? s_origClipCursor(r) : ClipCursor(r);
+    {
+        RECT sr;
+        int x0, y0, x1, y1;
+        gameToScreen(r->left, r->top, &x0, &y0);
+        gameToScreen(r->right, r->bottom, &x1, &y1);
+        sr.left = x0; sr.top = y0; sr.right = x1; sr.bottom = y1;
+        return s_origClipCursor ? s_origClipCursor(&sr) : ClipCursor(&sr);
+    }
+}
+
+static BOOL WINAPI hookedGetCursorPos(LPPOINT pt) {
+    BOOL result = s_origGetCursorPos ? s_origGetCursorPos(pt) : GetCursorPos(pt);
+    if (result && pt && g_dg.hwnd && g_dg.isOpen) {
+        int destX, destY, destW, destH;
+        POINT winPt = *pt;
+        /* screen -> client coords of game window */
+        ScreenToClient(g_dg.hwnd, &winPt);
+        getGameRect(&destX, &destY, &destW, &destH);
+        if (destW > 0 && destH > 0) {
+            long gx = ((long)winPt.x - destX) * (long)g_dg.width / (long)destW;
+            long gy = ((long)winPt.y - destY) * (long)g_dg.height / (long)destH;
+            /* Clamp minimum x to 1 (not 0) — see translateMouseLParam comment. */
+            if (gx < 1) gx = 1; else if (gx >= g_dg.width) gx = g_dg.width - 1;
+            if (gy < 0) gy = 0; else if (gy >= g_dg.height) gy = g_dg.height - 1;
+            /* Rewrite to game coords in SCREEN space — the client window is at (0,0) of screen */
+            POINT client = { (LONG)gx, (LONG)gy };
+            ClientToScreen(g_dg.hwnd, &client);
+            /* Actually the game uses these as-is, so return client coords directly */
+            pt->x = (LONG)gx;
+            pt->y = (LONG)gy;
+        }
+    }
+    return result;
+}
+
+/* Patch the game's IAT to redirect user32 functions */
+static void patchIAT(HMODULE hModule, const char* dllName, const char* funcName, FARPROC newFunc, FARPROC* origFunc) {
+    PIMAGE_DOS_HEADER dos = (PIMAGE_DOS_HEADER)hModule;
+    PIMAGE_NT_HEADERS nt;
+    PIMAGE_IMPORT_DESCRIPTOR imp;
+    if (!dos || dos->e_magic != IMAGE_DOS_SIGNATURE) return;
+    nt = (PIMAGE_NT_HEADERS)((BYTE*)hModule + dos->e_lfanew);
+    if (nt->Signature != IMAGE_NT_SIGNATURE) return;
+    if (!nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress) return;
+
+    imp = (PIMAGE_IMPORT_DESCRIPTOR)((BYTE*)hModule +
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress);
+
+    for (; imp->Name; imp++) {
+        const char* name = (const char*)hModule + imp->Name;
+        if (_stricmp(name, dllName) != 0) continue;
+        {
+            PIMAGE_THUNK_DATA oft = (PIMAGE_THUNK_DATA)((BYTE*)hModule + imp->OriginalFirstThunk);
+            PIMAGE_THUNK_DATA ft  = (PIMAGE_THUNK_DATA)((BYTE*)hModule + imp->FirstThunk);
+            for (; oft->u1.AddressOfData; oft++, ft++) {
+                PIMAGE_IMPORT_BY_NAME ibn;
+                if (oft->u1.Ordinal & IMAGE_ORDINAL_FLAG) continue;
+                ibn = (PIMAGE_IMPORT_BY_NAME)((BYTE*)hModule + oft->u1.AddressOfData);
+                if (strcmp((const char*)ibn->Name, funcName) == 0) {
+                    DWORD oldProtect;
+                    if (origFunc) *origFunc = (FARPROC)ft->u1.Function;
+                    VirtualProtect(&ft->u1.Function, sizeof(ft->u1.Function), PAGE_READWRITE, &oldProtect);
+                    ft->u1.Function = (ULONG_PTR)newFunc;
+                    VirtualProtect(&ft->u1.Function, sizeof(ft->u1.Function), oldProtect, &oldProtect);
+                    return;
+                }
+            }
+        }
+    }
+}
+
+static void hookMouseAPIs(void) {
+    HMODULE gameMod = GetModuleHandleA(NULL); /* main EXE */
+    patchIAT(gameMod, "user32.dll", "GetCursorPos", (FARPROC)hookedGetCursorPos, (FARPROC*)&s_origGetCursorPos);
+    patchIAT(gameMod, "user32.dll", "SetCursorPos", (FARPROC)hookedSetCursorPos, (FARPROC*)&s_origSetCursorPos);
+    patchIAT(gameMod, "user32.dll", "ClipCursor",   (FARPROC)hookedClipCursor,   (FARPROC*)&s_origClipCursor);
+    dg_log("  Mouse IAT hooks: Get=%p Set=%p Clip=%p\n",
+           s_origGetCursorPos, s_origSetCursorPos, s_origClipCursor);
+}
 
 int dg_d3d11_init(HWND hwnd, int width, int height) {
     HRESULT hr;
@@ -266,16 +519,27 @@ int dg_d3d11_init(HWND hwnd, int width, int height) {
     }
 
     g_dg.hwnd = hwnd;
-    g_dg.width = width;
+    g_dg.width = width;     /* native game resolution — 640x480 */
     g_dg.height = height;
+    g_dg.screenWidth = GetSystemMetrics(SM_CXSCREEN);
+    g_dg.screenHeight = GetSystemMetrics(SM_CYSCREEN);
+    dg_log("  Screen: %dx%d, game: %dx%d\n", g_dg.screenWidth, g_dg.screenHeight, width, height);
 
-    /* Don't touch the window — let the game manage it */
-    dg_log("  Using game window as-is\n");
+    /* Resize the game window to cover the screen (borderless fullscreen) */
+    SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+    SetWindowPos(hwnd, HWND_TOP, 0, 0, g_dg.screenWidth, g_dg.screenHeight,
+                 SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+    /* Hook the window proc to translate mouse coords from screen to game space */
+    g_dg.origWndProc = (WNDPROC)SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)dgWndProc);
+    dg_log("  Hooked WndProc (orig=%p)\n", g_dg.origWndProc);
+    /* IAT-patch GetCursorPos in the game EXE to translate screen->game coords */
+    hookMouseAPIs();
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = 1;
-    scd.BufferDesc.Width = (UINT)width;
-    scd.BufferDesc.Height = (UINT)height;
+    scd.BufferDesc.Width = (UINT)g_dg.screenWidth;   /* swap chain matches screen */
+    scd.BufferDesc.Height = (UINT)g_dg.screenHeight;
     scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
     scd.BufferDesc.RefreshRate.Numerator = 60;
     scd.BufferDesc.RefreshRate.Denominator = 1;
@@ -368,17 +632,68 @@ int dg_d3d11_init(HWND hwnd, int width, int height) {
     hr = ID3D11Device_CreateRenderTargetView(g_dg.device, (ID3D11Resource*)g_dg.backBuffer, NULL, &g_dg.rtv);
     if (FAILED(hr)) { dg_log("ERROR: CreateRTV failed\n"); return 0; }
 
-    if (!createDepthBuffer()) return 0;
-
-    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.rtv, NULL);
+    /* SSAA 2x: render at 2x internal, box-filter downsample to native.
+     * Averages out sub-pixel tri-edge seams; with proper aniso + Lanczos mips
+     * active, the downsample preserves plenty of detail. */
+    g_dg.msaaSamples = 1;
+    g_dg.ssaaFactor = 2;
+    g_dg.ssaaWidth = width * g_dg.ssaaFactor;
+    g_dg.ssaaHeight = height * g_dg.ssaaFactor;
+    dg_log("  AA: SSAA %dx (internal RT %dx%d → native %dx%d)\n",
+           g_dg.ssaaFactor, g_dg.ssaaWidth, g_dg.ssaaHeight, width, height);
 
     {
-        D3D11_VIEWPORT vp = { 0, 0, (float)width, (float)height, 0.0f, 1.0f };
+        D3D11_TEXTURE2D_DESC td = {0};
+        td.Width = (UINT)g_dg.ssaaWidth;
+        td.Height = (UINT)g_dg.ssaaHeight;
+        td.MipLevels = 1;
+        td.ArraySize = 1;
+        td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+        td.SampleDesc.Count = 1;
+        td.Usage = D3D11_USAGE_DEFAULT;
+        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+        hr = ID3D11Device_CreateTexture2D(g_dg.device, &td, NULL, &g_dg.gameTex);
+        if (FAILED(hr)) { dg_log("ERROR: CreateGameTex failed\n"); return 0; }
+
+        hr = ID3D11Device_CreateRenderTargetView(g_dg.device, (ID3D11Resource*)g_dg.gameTex, NULL, &g_dg.gameRtv);
+        if (FAILED(hr)) { dg_log("ERROR: CreateGameRTV failed\n"); return 0; }
+
+        hr = ID3D11Device_CreateShaderResourceView(g_dg.device,
+            (ID3D11Resource*)g_dg.gameTex, NULL, &g_dg.gameSrv);
+        if (FAILED(hr)) { dg_log("ERROR: CreateGameSRV failed\n"); return 0; }
+        dg_log("  Offscreen SSAA RT created: %dx%d\n", g_dg.ssaaWidth, g_dg.ssaaHeight);
+
+        /* Downsample target at native resolution */
+        td.Width = (UINT)width;
+        td.Height = (UINT)height;
+        hr = ID3D11Device_CreateTexture2D(g_dg.device, &td, NULL, &g_dg.downsampledTex);
+        if (FAILED(hr)) { dg_log("ERROR: CreateDownsampledTex failed\n"); return 0; }
+
+        hr = ID3D11Device_CreateRenderTargetView(g_dg.device,
+            (ID3D11Resource*)g_dg.downsampledTex, NULL, &g_dg.downsampledRtv);
+        if (FAILED(hr)) { dg_log("ERROR: CreateDownsampledRTV failed\n"); return 0; }
+
+        hr = ID3D11Device_CreateShaderResourceView(g_dg.device,
+            (ID3D11Resource*)g_dg.downsampledTex, NULL, &g_dg.downsampledSrv);
+        if (FAILED(hr)) { dg_log("ERROR: CreateDownsampledSRV failed\n"); return 0; }
+        dg_log("  Downsample RT created: %dx%d\n", width, height);
+    }
+
+    if (!createDepthBuffer()) return 0;
+
+    /* All game rendering goes to the offscreen target */
+    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.gameRtv, NULL);
+
+    {
+        /* Viewport matches the SSAA RT. The VS still maps game-space 640x480
+         * to NDC (-1..1), which the rasterizer then fills across the SSAA viewport. */
+        D3D11_VIEWPORT vp = { 0, 0, (float)g_dg.ssaaWidth, (float)g_dg.ssaaHeight, 0.0f, 1.0f };
         ID3D11DeviceContext_RSSetViewports(g_dg.context, 1, &vp);
     }
 
     if (!createLfbResources()) return 0;
     if (!createScenePipeline()) return 0;
+    if (!createBlitResources()) return 0;
 
     dg_state_init(width, height);
     dg_tex_init();
@@ -389,6 +704,181 @@ int dg_d3d11_init(HWND hwnd, int width, int height) {
 }
 
 /* ============================================================
+ * Final blit (offscreen game RT → swap chain with letterboxing)
+ * ============================================================ */
+
+static int createBlitResources(void) {
+    HRESULT hr;
+    ID3DBlob* vsBlob = NULL;
+    ID3DBlob* psBlob = NULL;
+    D3D11_SAMPLER_DESC sd = {0};
+    D3D11_BUFFER_DESC bd = {0};
+
+    if (!compileShader(s_blitShaderSrc, "VSMain", "vs_4_0", &vsBlob)) return 0;
+    if (!compileShader(s_blitShaderSrc, "PSMain", "ps_4_0", &psBlob)) { ID3D10Blob_Release(vsBlob); return 0; }
+
+    hr = ID3D11Device_CreateVertexShader(g_dg.device,
+        ID3D10Blob_GetBufferPointer(vsBlob), ID3D10Blob_GetBufferSize(vsBlob), NULL, &g_dg.blitVS);
+    ID3D10Blob_Release(vsBlob);
+    if (FAILED(hr)) { ID3D10Blob_Release(psBlob); return 0; }
+
+    hr = ID3D11Device_CreatePixelShader(g_dg.device,
+        ID3D10Blob_GetBufferPointer(psBlob), ID3D10Blob_GetBufferSize(psBlob), NULL, &g_dg.blitPS);
+    ID3D10Blob_Release(psBlob);
+    if (FAILED(hr)) return 0;
+
+    /* Bilinear sampler: the shader snaps UVs but lets bilinear smooth texel edges */
+    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    hr = ID3D11Device_CreateSamplerState(g_dg.device, &sd, &g_dg.blitSampler);
+    if (FAILED(hr)) return 0;
+
+    /* Constant buffer for target rect + texture size */
+    bd.ByteWidth = 32; /* float4 rect + float4 texSize = 32 bytes */
+    bd.Usage = D3D11_USAGE_DYNAMIC;
+    bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+    hr = ID3D11Device_CreateBuffer(g_dg.device, &bd, NULL, &g_dg.blitCB);
+    if (FAILED(hr)) return 0;
+
+    /* Downsample shader + sampler (linear, clamp) */
+    {
+        ID3DBlob* dvsBlob = NULL;
+        ID3DBlob* dpsBlob = NULL;
+        D3D11_SAMPLER_DESC dsd = {0};
+        if (!compileShader(s_downsampleShaderSrc, "VSMain", "vs_4_0", &dvsBlob)) return 0;
+        if (!compileShader(s_downsampleShaderSrc, "PSMain", "ps_4_0", &dpsBlob)) {
+            ID3D10Blob_Release(dvsBlob); return 0;
+        }
+        hr = ID3D11Device_CreateVertexShader(g_dg.device,
+            ID3D10Blob_GetBufferPointer(dvsBlob), ID3D10Blob_GetBufferSize(dvsBlob), NULL, &g_dg.downsampleVS);
+        ID3D10Blob_Release(dvsBlob);
+        if (FAILED(hr)) { ID3D10Blob_Release(dpsBlob); return 0; }
+        hr = ID3D11Device_CreatePixelShader(g_dg.device,
+            ID3D10Blob_GetBufferPointer(dpsBlob), ID3D10Blob_GetBufferSize(dpsBlob), NULL, &g_dg.downsamplePS);
+        ID3D10Blob_Release(dpsBlob);
+        if (FAILED(hr)) return 0;
+
+        dsd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        dsd.AddressU = dsd.AddressV = dsd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        dsd.MaxLOD = 0.0f;
+        hr = ID3D11Device_CreateSamplerState(g_dg.device, &dsd, &g_dg.downsampleSampler);
+        if (FAILED(hr)) return 0;
+    }
+
+    dg_log("  Blit resources created\n");
+    return 1;
+}
+
+/* Post-process AA pass: gameSrv (raw 3D) → downsampledRtv (AA'd, same size).
+ * Runs the FXAA shader (or box-downsample if ssaaFactor > 1). The HUD/LFB
+ * then blits on top of downsampledRtv so it stays pixel-sharp. */
+static void runAAPass(void) {
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr;
+    ID3D11ShaderResourceView* nullSrv = NULL;
+    D3D11_VIEWPORT vp = { 0, 0, (float)g_dg.width, (float)g_dg.height, 0.0f, 1.0f };
+
+    /* Update blitCB with SSAA source size (srcSize used by FXAA shader). */
+    hr = ID3D11DeviceContext_Map(g_dg.context, (ID3D11Resource*)g_dg.blitCB,
+        0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        float* f = (float*)mapped.pData;
+        f[0] = 0; f[1] = 0; f[2] = 0; f[3] = 0;
+        f[4] = (float)g_dg.ssaaWidth; f[5] = (float)g_dg.ssaaHeight;
+        f[6] = 1.0f / (float)g_dg.ssaaWidth; f[7] = 1.0f / (float)g_dg.ssaaHeight;
+        ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.blitCB, 0);
+    }
+
+    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.downsampledRtv, NULL);
+    ID3D11DeviceContext_RSSetViewports(g_dg.context, 1, &vp);
+    ID3D11DeviceContext_OMSetBlendState(g_dg.context, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_IASetInputLayout(g_dg.context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_dg.context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ID3D11DeviceContext_VSSetShader(g_dg.context, g_dg.downsampleVS, NULL, 0);
+    ID3D11DeviceContext_PSSetShader(g_dg.context, g_dg.downsamplePS, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(g_dg.context, 0, 1, &g_dg.blitCB);
+    ID3D11DeviceContext_PSSetShaderResources(g_dg.context, 0, 1, &g_dg.gameSrv);
+    ID3D11DeviceContext_PSSetSamplers(g_dg.context, 0, 1, &g_dg.downsampleSampler);
+    ID3D11DeviceContext_Draw(g_dg.context, 4, 0);
+    /* Unbind SRV so next pass can rebind the same texture as output if needed */
+    ID3D11DeviceContext_PSSetShaderResources(g_dg.context, 0, 1, &nullSrv);
+}
+
+static void blitGameToScreen(void) {
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    HRESULT hr;
+    float rectX0, rectY0, rectX1, rectY1;
+    float gameAspect, screenAspect, scale;
+    float destW, destH;
+    D3D11_VIEWPORT vp;
+
+    /* Compute aspect-preserved destination rect in NDC */
+    gameAspect = (float)g_dg.width / (float)g_dg.height;
+    screenAspect = (float)g_dg.screenWidth / (float)g_dg.screenHeight;
+
+    if (screenAspect > gameAspect) {
+        /* Screen wider than game — pillarbox (black bars on sides) */
+        scale = (float)g_dg.screenHeight / (float)g_dg.height;
+        destW = (float)g_dg.width * scale;
+        destH = (float)g_dg.screenHeight;
+    } else {
+        /* Screen taller than game — letterbox (bars top/bottom) */
+        scale = (float)g_dg.screenWidth / (float)g_dg.width;
+        destW = (float)g_dg.screenWidth;
+        destH = (float)g_dg.height * scale;
+    }
+
+    /* Convert destW/H to NDC coords centered on screen */
+    rectX0 = -destW / (float)g_dg.screenWidth;
+    rectX1 = +destW / (float)g_dg.screenWidth;
+    rectY0 = -destH / (float)g_dg.screenHeight;
+    rectY1 = +destH / (float)g_dg.screenHeight;
+
+    /* Update blit CB */
+    hr = ID3D11DeviceContext_Map(g_dg.context, (ID3D11Resource*)g_dg.blitCB,
+        0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+    if (SUCCEEDED(hr)) {
+        float* f = (float*)mapped.pData;
+        f[0] = rectX0; f[1] = rectY0; f[2] = rectX1; f[3] = rectY1;
+        f[4] = (float)g_dg.width; f[5] = (float)g_dg.height;
+        f[6] = 1.0f / (float)g_dg.width; f[7] = 1.0f / (float)g_dg.height;
+        ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.blitCB, 0);
+    }
+
+    /* Clear back buffer to black (for letterbox borders) */
+    {
+        float black[4] = {0, 0, 0, 1};
+        ID3D11DeviceContext_ClearRenderTargetView(g_dg.context, g_dg.rtv, black);
+    }
+
+    /* Full-screen viewport */
+    vp.TopLeftX = 0; vp.TopLeftY = 0;
+    vp.Width = (float)g_dg.screenWidth;
+    vp.Height = (float)g_dg.screenHeight;
+    vp.MinDepth = 0.0f; vp.MaxDepth = 1.0f;
+    ID3D11DeviceContext_RSSetViewports(g_dg.context, 1, &vp);
+
+    /* Bind swap chain back buffer + blit shader */
+    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.rtv, NULL);
+    ID3D11DeviceContext_OMSetBlendState(g_dg.context, NULL, NULL, 0xFFFFFFFF);
+    ID3D11DeviceContext_IASetInputLayout(g_dg.context, NULL);
+    ID3D11DeviceContext_IASetPrimitiveTopology(g_dg.context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
+    ID3D11DeviceContext_VSSetShader(g_dg.context, g_dg.blitVS, NULL, 0);
+    ID3D11DeviceContext_VSSetConstantBuffers(g_dg.context, 0, 1, &g_dg.blitCB);
+    ID3D11DeviceContext_PSSetShader(g_dg.context, g_dg.blitPS, NULL, 0);
+    ID3D11DeviceContext_PSSetConstantBuffers(g_dg.context, 0, 1, &g_dg.blitCB);
+    ID3D11DeviceContext_PSSetShaderResources(g_dg.context, 0, 1, &g_dg.downsampledSrv);
+    ID3D11DeviceContext_PSSetSamplers(g_dg.context, 0, 1, &g_dg.blitSampler);
+    ID3D11DeviceContext_Draw(g_dg.context, 4, 0);
+
+    /* Restore SSAA viewport for subsequent game draws */
+    vp.Width = (float)g_dg.ssaaWidth;
+    vp.Height = (float)g_dg.ssaaHeight;
+    ID3D11DeviceContext_RSSetViewports(g_dg.context, 1, &vp);
+}
+
+/* ============================================================
  * Depth buffer
  * ============================================================ */
 
@@ -396,12 +886,12 @@ static int createDepthBuffer(void) {
     D3D11_TEXTURE2D_DESC td = {0};
     HRESULT hr;
 
-    td.Width = (UINT)g_dg.width;
-    td.Height = (UINT)g_dg.height;
+    td.Width = (UINT)g_dg.ssaaWidth;
+    td.Height = (UINT)g_dg.ssaaHeight;
     td.MipLevels = 1;
     td.ArraySize = 1;
     td.Format = DXGI_FORMAT_D32_FLOAT;
-    td.SampleDesc.Count = 1;
+    td.SampleDesc.Count = 1;  /* SSAA only, no MSAA */
     td.Usage = D3D11_USAGE_DEFAULT;
     td.BindFlags = D3D11_BIND_DEPTH_STENCIL;
 
@@ -448,17 +938,27 @@ static int createScenePipeline(void) {
     hr = ID3D11Device_CreateBuffer(g_dg.device, &bd, NULL, &g_dg.combinerCB);
     if (FAILED(hr)) { dg_log("ERROR: CreateCB failed\n"); return 0; }
 
-    /* Samplers */
+    /* Fog table CB — 64 floats packed as 16 float4s (256 bytes) */
+    bd.ByteWidth = 256;
+    hr = ID3D11Device_CreateBuffer(g_dg.device, &bd, NULL, &g_dg.fogTableCB);
+    if (FAILED(hr)) { dg_log("ERROR: CreateFogCB failed\n"); return 0; }
+
+    /* 8x anisotropic, no LOD bias. Mipmap quality is improved via custom
+     * Kaiser-windowed sinc filtering at upload time (see dg_tex_download). */
     memset(&sd, 0, sizeof(sd));
+    sd.Filter = D3D11_FILTER_ANISOTROPIC;
+    sd.MaxAnisotropy = 8;
+    sd.MaxLOD = D3D11_FLOAT32_MAX;
+
     sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
+    hr = ID3D11Device_CreateSamplerState(g_dg.device, &sd, &g_dg.samplerWrap);
+    if (FAILED(hr)) { dg_log("ERROR: CreateSampler(wrap) failed\n"); return 0; }
+    g_dg.samplerPoint = g_dg.samplerWrap;     /* alias */
+    g_dg.samplerBilinear = g_dg.samplerWrap;  /* alias */
 
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_POINT;
-    hr = ID3D11Device_CreateSamplerState(g_dg.device, &sd, &g_dg.samplerPoint);
-    if (FAILED(hr)) { dg_log("ERROR: CreateSampler(point) failed\n"); return 0; }
-
-    sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-    hr = ID3D11Device_CreateSamplerState(g_dg.device, &sd, &g_dg.samplerBilinear);
-    if (FAILED(hr)) { dg_log("ERROR: CreateSampler(bilinear) failed\n"); return 0; }
+    sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+    hr = ID3D11Device_CreateSamplerState(g_dg.device, &sd, &g_dg.samplerClamp);
+    if (FAILED(hr)) { dg_log("ERROR: CreateSampler(clamp) failed\n"); return 0; }
 
     dg_log("  Scene pipeline created (shaders deferred)\n");
     return 1;
@@ -474,8 +974,9 @@ static int ensureSceneShaders(void) {
 
     dg_log("  Compiling scene shaders...\n");
 
-    if (!compileShader(s_sceneShaderSrc, "VSMain", "vs_4_0", &vsBlob)) return 0;
-    if (!compileShader(s_sceneShaderSrc, "PSMain", "ps_4_0", &psBlob)) {
+    /* ps_5_0 required for 'sample' interpolation modifier on PSIn */
+    if (!compileShader(s_sceneShaderSrc, "VSMain", "vs_5_0", &vsBlob)) return 0;
+    if (!compileShader(s_sceneShaderSrc, "PSMain", "ps_5_0", &psBlob)) {
         ID3D10Blob_Release(vsBlob); return 0;
     }
 
@@ -566,60 +1067,104 @@ void dg_apply_state(void) {
 
     /* Blend state */
     if (g_rs.blendDirty) {
-        D3D11_BLEND_DESC bd = {0};
-        if (g_dg.currentBlend) { ID3D11BlendState_Release(g_dg.currentBlend); g_dg.currentBlend = NULL; }
-
-        bd.RenderTarget[0].BlendEnable = !(g_rs.blend.srcRGB == 0x1 && g_rs.blend.dstRGB == 0x0);
-        bd.RenderTarget[0].SrcBlend = mapBlend(g_rs.blend.srcRGB, 1);
-        bd.RenderTarget[0].DestBlend = mapBlend(g_rs.blend.dstRGB, 0);
-        bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
-        bd.RenderTarget[0].SrcBlendAlpha = mapBlend(g_rs.blend.srcA, 1);
-        bd.RenderTarget[0].DestBlendAlpha = mapBlend(g_rs.blend.dstA, 0);
-        bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
-        bd.RenderTarget[0].RenderTargetWriteMask = 0;
-        if (g_rs.colorMaskRGB) bd.RenderTarget[0].RenderTargetWriteMask |= 0x07;
-        if (g_rs.colorMaskA) bd.RenderTarget[0].RenderTargetWriteMask |= 0x08;
-
-        hr = ID3D11Device_CreateBlendState(g_dg.device, &bd, &g_dg.currentBlend);
-        if (SUCCEEDED(hr)) {
+        /* Pack blend state into a single key for caching */
+        unsigned key = ((unsigned)(g_rs.blend.srcRGB & 0xF))
+                     | ((unsigned)(g_rs.blend.dstRGB & 0xF) << 4)
+                     | ((unsigned)(g_rs.blend.srcA   & 0xF) << 8)
+                     | ((unsigned)(g_rs.blend.dstA   & 0xF) << 12)
+                     | ((unsigned)(g_rs.colorMaskRGB ? 1 : 0) << 16)
+                     | ((unsigned)(g_rs.colorMaskA   ? 1 : 0) << 17);
+        ID3D11BlendState* bs = NULL;
+        int i;
+        for (i = 0; i < g_dg.blendCacheCount; i++) {
+            if (g_dg.blendCache[i].key == key) { bs = g_dg.blendCache[i].state; break; }
+        }
+        if (!bs) {
+            D3D11_BLEND_DESC bd = {0};
+            bd.RenderTarget[0].BlendEnable = !(g_rs.blend.srcRGB == 0x1 && g_rs.blend.dstRGB == 0x0);
+            bd.RenderTarget[0].SrcBlend = mapBlend(g_rs.blend.srcRGB, 1);
+            bd.RenderTarget[0].DestBlend = mapBlend(g_rs.blend.dstRGB, 0);
+            bd.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].SrcBlendAlpha = mapBlend(g_rs.blend.srcA, 1);
+            bd.RenderTarget[0].DestBlendAlpha = mapBlend(g_rs.blend.dstA, 0);
+            bd.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+            bd.RenderTarget[0].RenderTargetWriteMask = 0;
+            if (g_rs.colorMaskRGB) bd.RenderTarget[0].RenderTargetWriteMask |= 0x07;
+            if (g_rs.colorMaskA) bd.RenderTarget[0].RenderTargetWriteMask |= 0x08;
+            hr = ID3D11Device_CreateBlendState(g_dg.device, &bd, &bs);
+            if (SUCCEEDED(hr) && g_dg.blendCacheCount < 64) {
+                g_dg.blendCache[g_dg.blendCacheCount].key = key;
+                g_dg.blendCache[g_dg.blendCacheCount].state = bs;
+                g_dg.blendCacheCount++;
+            }
+        }
+        if (bs) {
             float blendFactor[4] = {0,0,0,0};
-            ID3D11DeviceContext_OMSetBlendState(g_dg.context, g_dg.currentBlend, blendFactor, 0xFFFFFFFF);
+            ID3D11DeviceContext_OMSetBlendState(g_dg.context, bs, blendFactor, 0xFFFFFFFF);
+            g_dg.currentBlend = bs;
         }
         g_rs.blendDirty = 0;
     }
 
     /* Depth-stencil state */
     if (g_rs.depthDirty) {
-        D3D11_DEPTH_STENCIL_DESC dd = {0};
-        if (g_dg.currentDepth) { ID3D11DepthStencilState_Release(g_dg.currentDepth); g_dg.currentDepth = NULL; }
-
-        dd.DepthEnable = (g_rs.depthMode != GR_DEPTHBUFFER_DISABLE);
-        dd.DepthWriteMask = g_rs.depthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
-        dd.DepthFunc = mapCmp(g_rs.depthFunc);
-        dd.StencilEnable = FALSE;
-
-        hr = ID3D11Device_CreateDepthStencilState(g_dg.device, &dd, &g_dg.currentDepth);
-        if (SUCCEEDED(hr))
-            ID3D11DeviceContext_OMSetDepthStencilState(g_dg.context, g_dg.currentDepth, 0);
+        unsigned key = ((unsigned)(g_rs.depthFunc & 0xF))
+                     | ((unsigned)(g_rs.depthMode & 0xF) << 4)
+                     | ((unsigned)(g_rs.depthMask ? 1 : 0) << 8);
+        ID3D11DepthStencilState* ds = NULL;
+        int i;
+        for (i = 0; i < g_dg.depthCacheCount; i++) {
+            if (g_dg.depthCache[i].key == key) { ds = g_dg.depthCache[i].state; break; }
+        }
+        if (!ds) {
+            D3D11_DEPTH_STENCIL_DESC dd = {0};
+            dd.DepthEnable = (g_rs.depthMode != GR_DEPTHBUFFER_DISABLE);
+            dd.DepthWriteMask = g_rs.depthMask ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
+            dd.DepthFunc = mapCmp(g_rs.depthFunc);
+            dd.StencilEnable = FALSE;
+            hr = ID3D11Device_CreateDepthStencilState(g_dg.device, &dd, &ds);
+            if (SUCCEEDED(hr) && g_dg.depthCacheCount < 64) {
+                g_dg.depthCache[g_dg.depthCacheCount].key = key;
+                g_dg.depthCache[g_dg.depthCacheCount].state = ds;
+                g_dg.depthCacheCount++;
+            }
+        }
+        if (ds) {
+            ID3D11DeviceContext_OMSetDepthStencilState(g_dg.context, ds, 0);
+            g_dg.currentDepth = ds;
+        }
         g_rs.depthDirty = 0;
     }
 
     /* Rasterizer state */
     if (g_rs.rasterDirty) {
-        D3D11_RASTERIZER_DESC rd = {0};
-        if (g_dg.currentRaster) { ID3D11RasterizerState_Release(g_dg.currentRaster); g_dg.currentRaster = NULL; }
-
-        rd.FillMode = D3D11_FILL_SOLID;
-        /* Disable culling — Glide winding doesn't match D3D11 reliably */
-        rd.CullMode = D3D11_CULL_NONE;
-        rd.FrontCounterClockwise = FALSE;
-        rd.DepthBias = (INT)g_rs.depthBias;
-        rd.ScissorEnable = FALSE;
-        rd.DepthClipEnable = TRUE;
-
-        hr = ID3D11Device_CreateRasterizerState(g_dg.device, &rd, &g_dg.currentRaster);
-        if (SUCCEEDED(hr))
-            ID3D11DeviceContext_RSSetState(g_dg.context, g_dg.currentRaster);
+        unsigned key = (unsigned)((int)g_rs.depthBias & 0xFFFF);
+        ID3D11RasterizerState* rs = NULL;
+        int i;
+        for (i = 0; i < g_dg.rasterCacheCount; i++) {
+            if (g_dg.rasterCache[i].key == key) { rs = g_dg.rasterCache[i].state; break; }
+        }
+        if (!rs) {
+            D3D11_RASTERIZER_DESC rd = {0};
+            rd.FillMode = D3D11_FILL_SOLID;
+            rd.CullMode = D3D11_CULL_NONE;
+            rd.FrontCounterClockwise = FALSE;
+            rd.DepthBias = (INT)g_rs.depthBias;
+            rd.ScissorEnable = FALSE;
+            rd.DepthClipEnable = TRUE;
+            rd.MultisampleEnable = FALSE; /* MSAA off — SSAA instead */
+            rd.AntialiasedLineEnable = FALSE;
+            hr = ID3D11Device_CreateRasterizerState(g_dg.device, &rd, &rs);
+            if (SUCCEEDED(hr) && g_dg.rasterCacheCount < 32) {
+                g_dg.rasterCache[g_dg.rasterCacheCount].key = key;
+                g_dg.rasterCache[g_dg.rasterCacheCount].state = rs;
+                g_dg.rasterCacheCount++;
+            }
+        }
+        if (rs) {
+            ID3D11DeviceContext_RSSetState(g_dg.context, rs);
+            g_dg.currentRaster = rs;
+        }
         g_rs.rasterDirty = 0;
     }
 
@@ -633,6 +1178,20 @@ void dg_apply_state(void) {
             ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.combinerCB, 0);
         }
         g_rs.combinerDirty = 0;
+    }
+
+    /* Fog table CB — pack 64 FxU8 entries as 64 floats in [0,1] across 16 float4s */
+    if (g_rs.fogTableDirty) {
+        D3D11_MAPPED_SUBRESOURCE mapped;
+        hr = ID3D11DeviceContext_Map(g_dg.context, (ID3D11Resource*)g_dg.fogTableCB,
+                                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+        if (SUCCEEDED(hr)) {
+            float* f = (float*)mapped.pData;
+            int i;
+            for (i = 0; i < 64; i++) f[i] = (float)g_rs.fogTable[i] / 255.0f;
+            ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.fogTableCB, 0);
+        }
+        g_rs.fogTableDirty = 0;
     }
 }
 
@@ -672,11 +1231,15 @@ static void convertVertex(DGVertex* out, const GrVertex* in) {
     out->oow0 = tmuOow;
 }
 
+/* Ring-buffer vertex position tracking */
+static int g_vbWritePos = 0;
+
 void dg_draw_triangle(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
     DGVertex verts[3];
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr;
     UINT stride, offset;
+    D3D11_MAP mapType;
 
     if (!g_dg.isOpen || !a || !b || !c) return;
     if (!ensureSceneShaders()) return;
@@ -730,10 +1293,20 @@ void dg_draw_triangle(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
 
         if (logCount < 3) dg_log("  draw_tri: uploading verts\n");
 
+        /* Ring buffer: use WRITE_DISCARD when buffer is full (rename), otherwise NO_OVERWRITE */
+        if (g_vbWritePos + 3 > DG_MAX_VERTICES) {
+            g_vbWritePos = 0;
+            mapType = D3D11_MAP_WRITE_DISCARD;
+        } else if (g_vbWritePos == 0) {
+            mapType = D3D11_MAP_WRITE_DISCARD;
+        } else {
+            mapType = D3D11_MAP_WRITE_NO_OVERWRITE;
+        }
+
         hr = ID3D11DeviceContext_Map(g_dg.context, (ID3D11Resource*)g_dg.vertexBuffer,
-                                     0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
+                                     0, mapType, 0, &mapped);
         if (FAILED(hr)) { dg_log("  draw_tri: Map failed\n"); return; }
-        memcpy(mapped.pData, verts, sizeof(verts));
+        memcpy((DGVertex*)mapped.pData + g_vbWritePos, verts, sizeof(verts));
         ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.vertexBuffer, 0);
 
         if (logCount < 3) dg_log("  draw_tri: binding pipeline\n");
@@ -747,11 +1320,13 @@ void dg_draw_triangle(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
         ID3D11DeviceContext_PSSetShader(g_dg.context, g_dg.scenePS, NULL, 0);
         ID3D11DeviceContext_VSSetConstantBuffers(g_dg.context, 0, 1, &g_dg.combinerCB);
         ID3D11DeviceContext_PSSetConstantBuffers(g_dg.context, 0, 1, &g_dg.combinerCB);
+        ID3D11DeviceContext_PSSetConstantBuffers(g_dg.context, 1, 1, &g_dg.fogTableCB);
 
         {
             ID3D11ShaderResourceView* srv = dg_tex_get_srv(g_rs.texSourceAddr[0]);
-            ID3D11SamplerState* smp = (g_rs.texMinFilter[0] == GR_TEXTUREFILTER_BILINEAR)
-                                      ? g_dg.samplerBilinear : g_dg.samplerPoint;
+            /* Select sampler based on game's grTexClampMode setting */
+            ID3D11SamplerState* smp = (g_rs.texClampS[0] == GR_TEXTURECLAMP_CLAMP)
+                                      ? g_dg.samplerClamp : g_dg.samplerWrap;
             if (logCount < 3 || (drawCount >= 100 && drawCount <= 103)) {
                 dg_log("  draw_tri #%d: tex addr=0x%X srv=%p\n", drawCount, g_rs.texSourceAddr[0], srv);
             }
@@ -765,17 +1340,19 @@ void dg_draw_triangle(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
                     missCount++;
                 }
             }
-            if (srv)
-                ID3D11DeviceContext_PSSetShaderResources(g_dg.context, 0, 1, &srv);
+            /* On miss, bind deterministic black texture instead of NULL */
+            if (!srv) srv = dg_tex_get_miss_srv();
+            ID3D11DeviceContext_PSSetShaderResources(g_dg.context, 0, 1, &srv);
             ID3D11DeviceContext_PSSetSamplers(g_dg.context, 0, 1, &smp);
         }
 
-        ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.rtv, g_dg.dsv);
+        ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.gameRtv, g_dg.dsv);
 
         if (logCount < 3) dg_log("  draw_tri: drawing\n");
-        ID3D11DeviceContext_Draw(g_dg.context, 3, 0);
+        ID3D11DeviceContext_Draw(g_dg.context, 3, (UINT)g_vbWritePos);
         if (logCount < 3) dg_log("  draw_tri: done\n");
 
+        g_vbWritePos += 3;
         logCount++;
     }
 }
@@ -788,10 +1365,17 @@ void dg_d3d11_present(int swapInterval) {
     HRESULT hr;
     if (!g_dg.isOpen || !g_dg.swapChain) return;
 
-    /* Blit LFB when written */
+    /* Step 1: AA pass (FXAA or SSAA downsample) writes gameTex → downsampledTex.
+     * FXAA runs on the 3D-only image so the HUD stays sharp when overlaid next. */
+    runAAPass();
+
+    /* Step 2: Blit LFB/HUD onto the AA'd scene (now in downsampledRtv). */
     if (g_dg.lfbLockedThisFrame) {
         dg_lfb_flush();
     }
+
+    /* Step 3: Sharp-bilinear upscale downsampledTex → swap chain back buffer. */
+    blitGameToScreen();
 
     hr = IDXGISwapChain_Present(g_dg.swapChain, (UINT)(swapInterval > 0 ? 1 : 0), 0);
     if (FAILED(hr)) {
@@ -802,24 +1386,47 @@ void dg_d3d11_present(int swapInterval) {
         }
     }
 
-    /* Reset per-frame tracking — DON'T clear LFB, let it persist like real framebuffer */
+    /* Restore offscreen game RT for next frame */
+    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.gameRtv, g_dg.dsv);
+
+    /* Wipe LFB only if the game actually wrote to it this frame (locked).
+     * If the game didn't touch LFB, its content is still valid from the
+     * previous frame — wiping would destroy static overlays (XP bar, etc)
+     * that the game doesn't redraw every frame. */
+    if (g_dg.drewThisFrame && g_dg.lfbLockedThisFrame && g_dg.lfbCpuBuffer) {
+        FxU16* p = (FxU16*)g_dg.lfbCpuBuffer;
+        int i, count = g_dg.width * g_dg.height;
+        for (i = 0; i < count; i++) p[i] = 0xF81F;
+    }
     g_dg.lfbLockedThisFrame = 0;
     g_dg.drewThisFrame = 0;
     g_dg.lfbDirty = 0;
+
+    /* Advance texture cache LRU frame counter + opportunistic eviction */
+    dg_tex_tick_frame();
 }
 
 void dg_d3d11_clear(float r, float g, float b, float a, float depth) {
     if (!g_dg.isOpen) return;
     {
         float color[4] = { r, g, b, a };
-        ID3D11DeviceContext_ClearRenderTargetView(g_dg.context, g_dg.rtv, color);
+        ID3D11DeviceContext_ClearRenderTargetView(g_dg.context, g_dg.gameRtv, color);
     }
     if (g_dg.dsv)
         ID3D11DeviceContext_ClearDepthStencilView(g_dg.context, g_dg.dsv, D3D11_CLEAR_DEPTH, depth, 0);
 
-    /* Clear LFB on grBufferClear so stale menu content doesn't cover 3D */
-    if (g_dg.lfbCpuBuffer)
-        memset(g_dg.lfbCpuBuffer, 0, g_dg.width * g_dg.height * 4);
+    /* Clear LFB on grBufferClear — fill with magenta sentinel so 3D shows through
+     * unwritten pixels but legitimate black HUD pixels still render opaque. */
+    if (g_dg.lfbCpuBuffer) {
+        FxU16* p = (FxU16*)g_dg.lfbCpuBuffer;
+        int i, count = g_dg.width * g_dg.height;
+        for (i = 0; i < count; i++) p[i] = 0xF81F;
+    }
+    /* Also clear the HUD stable buffer — scene transitions should dump accumulated
+     * HUD overlays (see dg_lfb_flush for what lfbStable is). */
+    if (g_dg.lfbStable) {
+        memset(g_dg.lfbStable, 0, g_dg.width * g_dg.height * 4);
+    }
 }
 
 /* ============================================================
@@ -835,6 +1442,10 @@ static int createLfbResources(void) {
 
     g_dg.lfbCpuBuffer = (FxU8*)calloc(1, g_dg.width * g_dg.height * 4);
     if (!g_dg.lfbCpuBuffer) return 0;
+
+    /* HUD stable buffer — see dg_lfb_flush for what this is and why it exists. */
+    g_dg.lfbStable = (FxU32*)calloc(1, g_dg.width * g_dg.height * 4);
+    if (!g_dg.lfbStable) return 0;
 
     memset(&td, 0, sizeof(td));
     td.Width = (UINT)g_dg.width;
@@ -908,21 +1519,91 @@ void dg_lfb_flush(void) {
         FxU8* dst = (FxU8*)mapped.pData;
         FxU8* src = g_dg.lfbCpuBuffer;
         {
+            /* -----------------------------------------------------------------------
+             * HUD PERSISTENCE HACK
+             * -----------------------------------------------------------------------
+             * Problem: KQ8 draws certain static HUD elements (XP bar, decorative
+             * face overlay on the KQ icon, etc.) only occasionally — typically once
+             * when they first appear, and then NEVER redraws them in subsequent
+             * frames. The main inventory UI bar IS redrawn every frame.
+             *
+             * Our per-frame LFB wipe (which is essential to prevent smearing of
+             * dynamic elements like the cursor, dialogue text, subtitles) destroys
+             * those static overlays. On frame N the game drew main UI + XP bar.
+             * We wipe. On frame N+1 the game redraws only main UI. XP bar is now
+             * sentinel → transparent → 3D shows through (often black at night).
+             * End result: XP bar flickers out and stays missing.
+             *
+             * We can't distinguish "game didn't redraw because it's static" from
+             * "game didn't redraw because it's gone" at the pixel level without
+             * more info from the game. But KQ8 has a convenient structural property:
+             *
+             *   The HUD bars (top and bottom) span the full screen width, AND
+             *   nothing ever renders at x=0 *except* those HUD bars. Dynamic
+             *   elements (cursor, dialogue modals, subtitles) always appear
+             *   somewhere in the interior of the screen.
+             *
+             * So we probe the leftmost column of the LFB each flush. Where it's
+             * non-sentinel, we know we're inside a HUD bar. That gives us the
+             * topHudBottom and bottomHudTop Y-coordinates.
+             *
+             * For rows inside the HUD bar region, we accumulate non-sentinel
+             * pixels into `lfbStable` — a persistent buffer that's only reset
+             * on grBufferClear. Those accumulated pixels are used for the final
+             * composite regardless of whether the game redrew them this frame.
+             *
+             * Rows OUTSIDE the HUD region (the interior 3D viewport) use the
+             * normal sentinel-handling path, so dynamic elements continue to
+             * wipe cleanly between frames.
+             * ----------------------------------------------------------------------- */
+            const FxU16 SENTINEL = 0xF81F;
             int is3dFrame = g_dg.drewThisFrame;
+            int topHudBottom = 0;    /* HUD occupies y < topHudBottom */
+            int bottomHudTop = g_dg.height; /* HUD occupies y >= bottomHudTop */
+
+            /* Probe left column to find HUD extents */
+            for (y = 0; y < g_dg.height; y++) {
+                FxU16 c = ((FxU16*)(src + y * g_dg.lfbStride))[0];
+                if (c == SENTINEL) break;
+                topHudBottom = y + 1;
+            }
+            for (y = g_dg.height - 1; y >= 0; y--) {
+                FxU16 c = ((FxU16*)(src + y * g_dg.lfbStride))[0];
+                if (c == SENTINEL) break;
+                bottomHudTop = y;
+            }
+
             for (y = 0; y < g_dg.height; y++) {
                 FxU32* dstRow = (FxU32*)(dst + y * mapped.RowPitch);
                 FxU16* srcRow = (FxU16*)(src + y * g_dg.lfbStride);
-                for (x = 0; x < g_dg.width; x++) {
-                    FxU16 c = srcRow[x];
-                    FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
-                    FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
-                    FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
-                    if (is3dFrame && c == 0) {
-                        /* During gameplay: unwritten pixels are transparent (3D shows through) */
-                        dstRow[x] = 0x00000000;
-                    } else {
-                        /* Menu/loading OR written pixel: fully opaque */
-                        dstRow[x] = 0xFF000000 | ((FxU32)b << 16) | ((FxU32)g << 8) | r;
+                int inHud = (y < topHudBottom) || (y >= bottomHudTop);
+
+                if (inHud) {
+                    /* HUD row: merge any non-sentinel pixels this frame into the
+                     * persistent stable buffer, then use lfbStable for display. */
+                    FxU32* stableRow = g_dg.lfbStable + y * g_dg.width;
+                    for (x = 0; x < g_dg.width; x++) {
+                        FxU16 c = srcRow[x];
+                        if (c != SENTINEL) {
+                            FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
+                            FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
+                            FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
+                            stableRow[x] = 0xFF000000 | ((FxU32)b << 16) | ((FxU32)g << 8) | r;
+                        }
+                        dstRow[x] = stableRow[x];
+                    }
+                } else {
+                    /* 3D-viewport row: regular sentinel handling. */
+                    for (x = 0; x < g_dg.width; x++) {
+                        FxU16 c = srcRow[x];
+                        if (c == SENTINEL) {
+                            dstRow[x] = is3dFrame ? 0x00000000 : 0xFF000000;
+                        } else {
+                            FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
+                            FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
+                            FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
+                            dstRow[x] = 0xFF000000 | ((FxU32)b << 16) | ((FxU32)g << 8) | r;
+                        }
                     }
                 }
             }
@@ -932,8 +1613,9 @@ void dg_lfb_flush(void) {
     ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.lfbTexture, 0);
     dg_log("  lfb_flush: drawing quad\n");
 
-    /* Opaque LFB blit — covers entire screen (menu/loading frames) */
-    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.rtv, NULL);
+    /* LFB blits onto the AA'd (post-FXAA) buffer so the HUD stays sharp —
+     * final sharp-bilinear upscale to screen happens next in blitGameToScreen. */
+    ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.downsampledRtv, NULL);
     ID3D11DeviceContext_OMSetBlendState(g_dg.context, NULL, NULL, 0xFFFFFFFF); /* no blending */
     ID3D11DeviceContext_IASetInputLayout(g_dg.context, NULL);
     ID3D11DeviceContext_IASetPrimitiveTopology(g_dg.context, D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
@@ -951,20 +1633,59 @@ void dg_lfb_flush(void) {
  * ============================================================ */
 
 void dg_d3d11_shutdown(void) {
-    dg_log("dg_d3d11_shutdown\n");
-    dg_tex_shutdown();
+    dg_log("dg_d3d11_shutdown: begin\n");
 
-    if (g_dg.currentBlend)  { ID3D11BlendState_Release(g_dg.currentBlend);  g_dg.currentBlend = NULL; }
-    if (g_dg.currentDepth)  { ID3D11DepthStencilState_Release(g_dg.currentDepth);  g_dg.currentDepth = NULL; }
-    if (g_dg.currentRaster) { ID3D11RasterizerState_Release(g_dg.currentRaster); g_dg.currentRaster = NULL; }
+    /* Mark closed FIRST so hooks stop translating */
+    g_dg.isOpen = 0;
+
+    /* Restore original WndProc so our proc doesn't get called after DLL unload */
+    if (g_dg.origWndProc && g_dg.hwnd) {
+        SetWindowLongPtr(g_dg.hwnd, GWLP_WNDPROC, (LONG_PTR)g_dg.origWndProc);
+        g_dg.origWndProc = NULL;
+    }
+
+    dg_log("  shutdown: hooks restored\n");
+
+    /* Flush pending GPU work before releasing resources — avoids driver-level hang */
+    if (g_dg.context) {
+        dg_log("  shutdown: ClearState\n");
+        ID3D11DeviceContext_ClearState(g_dg.context);
+        dg_log("  shutdown: Flush\n");
+        ID3D11DeviceContext_Flush(g_dg.context);
+        dg_log("  shutdown: flushed\n");
+    }
+
+    dg_log("  shutdown: dg_tex_shutdown\n");
+    dg_tex_shutdown();
+    dg_log("  shutdown: tex done\n");
+
+    {
+        int i;
+        for (i = 0; i < g_dg.blendCacheCount; i++)
+            if (g_dg.blendCache[i].state) ID3D11BlendState_Release(g_dg.blendCache[i].state);
+        for (i = 0; i < g_dg.depthCacheCount; i++)
+            if (g_dg.depthCache[i].state) ID3D11DepthStencilState_Release(g_dg.depthCache[i].state);
+        for (i = 0; i < g_dg.rasterCacheCount; i++)
+            if (g_dg.rasterCache[i].state) ID3D11RasterizerState_Release(g_dg.rasterCache[i].state);
+        g_dg.blendCacheCount = 0;
+        g_dg.depthCacheCount = 0;
+        g_dg.rasterCacheCount = 0;
+    }
+    g_dg.currentBlend = NULL;
+    g_dg.currentDepth = NULL;
+    g_dg.currentRaster = NULL;
 
     if (g_dg.combinerCB)    { ID3D11Buffer_Release(g_dg.combinerCB);     g_dg.combinerCB = NULL; }
+    if (g_dg.fogTableCB)    { ID3D11Buffer_Release(g_dg.fogTableCB);     g_dg.fogTableCB = NULL; }
     if (g_dg.vertexBuffer)  { ID3D11Buffer_Release(g_dg.vertexBuffer);   g_dg.vertexBuffer = NULL; }
     if (g_dg.sceneLayout)   { ID3D11InputLayout_Release(g_dg.sceneLayout); g_dg.sceneLayout = NULL; }
     if (g_dg.scenePS)       { ID3D11PixelShader_Release(g_dg.scenePS);   g_dg.scenePS = NULL; }
     if (g_dg.sceneVS)       { ID3D11VertexShader_Release(g_dg.sceneVS);  g_dg.sceneVS = NULL; }
-    if (g_dg.samplerPoint)  { ID3D11SamplerState_Release(g_dg.samplerPoint);  g_dg.samplerPoint = NULL; }
-    if (g_dg.samplerBilinear) { ID3D11SamplerState_Release(g_dg.samplerBilinear); g_dg.samplerBilinear = NULL; }
+    /* samplerPoint/Bilinear are aliases for samplerWrap — don't double-release */
+    g_dg.samplerPoint = NULL;
+    g_dg.samplerBilinear = NULL;
+    if (g_dg.samplerWrap)  { ID3D11SamplerState_Release(g_dg.samplerWrap);  g_dg.samplerWrap = NULL; }
+    if (g_dg.samplerClamp) { ID3D11SamplerState_Release(g_dg.samplerClamp); g_dg.samplerClamp = NULL; }
 
     if (g_dg.lfbSampler)   { ID3D11SamplerState_Release(g_dg.lfbSampler);  g_dg.lfbSampler = NULL; }
     if (g_dg.lfbPS)         { ID3D11PixelShader_Release(g_dg.lfbPS);       g_dg.lfbPS = NULL; }
@@ -972,14 +1693,37 @@ void dg_d3d11_shutdown(void) {
     if (g_dg.lfbSRV)        { ID3D11ShaderResourceView_Release(g_dg.lfbSRV); g_dg.lfbSRV = NULL; }
     if (g_dg.lfbTexture)    { ID3D11Texture2D_Release(g_dg.lfbTexture);    g_dg.lfbTexture = NULL; }
     if (g_dg.lfbCpuBuffer)  { free(g_dg.lfbCpuBuffer);                     g_dg.lfbCpuBuffer = NULL; }
+    if (g_dg.lfbStable)     { free(g_dg.lfbStable);                        g_dg.lfbStable = NULL; }
 
+    /* Blit + downsample resources */
+    if (g_dg.blitCB)            { ID3D11Buffer_Release(g_dg.blitCB);           g_dg.blitCB = NULL; }
+    if (g_dg.blitSampler)       { ID3D11SamplerState_Release(g_dg.blitSampler); g_dg.blitSampler = NULL; }
+    if (g_dg.blitPS)            { ID3D11PixelShader_Release(g_dg.blitPS);       g_dg.blitPS = NULL; }
+    if (g_dg.blitVS)            { ID3D11VertexShader_Release(g_dg.blitVS);      g_dg.blitVS = NULL; }
+    if (g_dg.downsampleSampler) { ID3D11SamplerState_Release(g_dg.downsampleSampler); g_dg.downsampleSampler = NULL; }
+    if (g_dg.downsamplePS)      { ID3D11PixelShader_Release(g_dg.downsamplePS); g_dg.downsamplePS = NULL; }
+    if (g_dg.downsampleVS)      { ID3D11VertexShader_Release(g_dg.downsampleVS); g_dg.downsampleVS = NULL; }
+
+    /* Offscreen game RT + downsample chain */
+    if (g_dg.downsampledSrv) { ID3D11ShaderResourceView_Release(g_dg.downsampledSrv); g_dg.downsampledSrv = NULL; }
+    if (g_dg.downsampledRtv) { ID3D11RenderTargetView_Release(g_dg.downsampledRtv);   g_dg.downsampledRtv = NULL; }
+    if (g_dg.downsampledTex) { ID3D11Texture2D_Release(g_dg.downsampledTex);          g_dg.downsampledTex = NULL; }
+    if (g_dg.gameSrv)       { ID3D11ShaderResourceView_Release(g_dg.gameSrv); g_dg.gameSrv = NULL; }
+    if (g_dg.gameRtv)       { ID3D11RenderTargetView_Release(g_dg.gameRtv);    g_dg.gameRtv = NULL; }
+    if (g_dg.gameResolved)  { ID3D11Texture2D_Release(g_dg.gameResolved);      g_dg.gameResolved = NULL; }
+    if (g_dg.gameTex)       { ID3D11Texture2D_Release(g_dg.gameTex);           g_dg.gameTex = NULL; }
+
+    dg_log("  shutdown: releasing dsv/depth/rtv\n");
     if (g_dg.dsv)           { ID3D11DepthStencilView_Release(g_dg.dsv);     g_dg.dsv = NULL; }
     if (g_dg.depthTex)      { ID3D11Texture2D_Release(g_dg.depthTex);      g_dg.depthTex = NULL; }
     if (g_dg.rtv)           { ID3D11RenderTargetView_Release(g_dg.rtv);     g_dg.rtv = NULL; }
     if (g_dg.backBuffer)    { ID3D11Texture2D_Release(g_dg.backBuffer);    g_dg.backBuffer = NULL; }
-    if (g_dg.swapChain)     { IDXGISwapChain_Release(g_dg.swapChain);     g_dg.swapChain = NULL; }
-    if (g_dg.context)       { ID3D11DeviceContext_Release(g_dg.context);   g_dg.context = NULL; }
-    if (g_dg.device)        { ID3D11Device_Release(g_dg.device);           g_dg.device = NULL; }
+    /* Skip releasing swap chain, context, and device — they can hang on GPU sync.
+     * The OS will clean them up on process exit. This is safe because the process
+     * is terminating right after grGlideShutdown returns. */
+    g_dg.swapChain = NULL;
+    g_dg.context = NULL;
+    g_dg.device = NULL;
 
-    g_dg.isOpen = 0;
+    dg_log("dg_d3d11_shutdown: complete\n");
 }

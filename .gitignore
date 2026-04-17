@@ -1,3 +1,20 @@
+# Build output
 *.obj
+*.exp
+*.lib
+*.pdb
+*.dll
 build/
+
+# Logs
 *.log
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.sln
+*.vcxproj*
+
+# Agent / tool scratch
+.claude/

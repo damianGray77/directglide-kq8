@@ -91,6 +91,11 @@ typedef struct {
     int texMipMapMode[2];
     float texLodBias[2];
 
+    /* Fog table (64 entries, 0-255 density) + expanded 16 float4 view for the CB.
+     * Populated by grFogTable; gu* generators produce the source 64-entry table. */
+    FxU8  fogTable[64];
+    int   fogTableDirty;
+
     /* Dirty flags */
     int combinerDirty;
     int blendDirty;

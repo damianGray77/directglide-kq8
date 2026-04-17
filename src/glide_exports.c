@@ -342,15 +342,45 @@ void __stdcall grFogColorValue(GrColor_t color) {
     g_rs.combiner.fogB = (float)( color        & 0xFF) / 255.0f;
     g_rs.combiner.fogA = (float)((color >> 24) & 0xFF) / 255.0f;
     g_rs.combinerDirty = 1;
+    {
+        static FxU32 lastColor = 0xFFFFFFFF;
+        if (color != lastColor) {
+            dg_log("grFogColorValue: 0x%08X (R=%.2f G=%.2f B=%.2f)\n",
+                   color, g_rs.combiner.fogR, g_rs.combiner.fogG, g_rs.combiner.fogB);
+            lastColor = color;
+        }
+    }
 }
 
 void __stdcall grFogMode(GrFogMode_t mode) {
     g_rs.combiner.fogMode = mode;
     g_rs.combinerDirty = 1;
+    {
+        static int lastMode = -1;
+        if ((int)mode != lastMode) {
+            dg_log("grFogMode: %d\n", mode);
+            lastMode = mode;
+        }
+    }
 }
 
 void __stdcall grFogTable(const GrFog_t* table) {
-    (void)table; /* TODO: upload fog table as 1D texture */
+    if (!table) return;
+    memcpy(g_rs.fogTable, table, 64);
+    g_rs.fogTableDirty = 1;
+    {
+        static int logged = 0;
+        if (logged < 3) {
+            int i;
+            dg_log("grFogTable (call #%d):\n", logged + 1);
+            for (i = 0; i < 64; i += 8) {
+                dg_log("  [%02d..%02d]: %3d %3d %3d %3d %3d %3d %3d %3d\n", i, i+7,
+                       table[i], table[i+1], table[i+2], table[i+3],
+                       table[i+4], table[i+5], table[i+6], table[i+7]);
+            }
+            logged++;
+        }
+    }
 }
 
 void __stdcall grGammaCorrectionValue(float value) {
@@ -844,24 +874,79 @@ void __stdcall guFbWriteRegion(int dstX, int dstY, int w, int h, void* src, int 
     (void)dstX; (void)dstY; (void)w; (void)h; (void)src; (void)srcStride;
 }
 
+/* Glide fog W lookup table — canonical values from OpenGlide's OGLFogTables.cpp.
+ * Maps 64 fog-table indices to the eye-space W value where each entry "sits". */
+static const float g_fogIndexToW[64] = {
+    1.000000f,   1.142857f,   1.333333f,   1.600000f,
+    2.000000f,   2.285714f,   2.666667f,   3.200000f,
+    4.000000f,   4.571429f,   5.333333f,   6.400000f,
+    8.000000f,   9.142858f,  10.666667f,  12.800000f,
+   16.000000f,  18.285715f,  21.333334f,  25.600000f,
+   32.000000f,  36.571430f,  42.666668f,  51.200001f,
+   64.000000f,  73.142860f,  85.333336f, 102.400002f,
+  128.000000f, 146.285721f, 170.666672f, 204.800003f,
+  256.000000f, 292.571442f, 341.333344f, 409.600006f,
+  512.000000f, 585.142883f, 682.666687f, 819.200012f,
+ 1024.000000f,1170.285767f,1365.333374f,1638.400024f,
+ 2048.000000f,2340.571533f,2730.666748f,3276.800049f,
+ 4096.000000f,4681.143066f,5461.333496f,6553.600098f,
+ 8192.000000f,9362.286133f,10922.666992f,13107.200195f,
+16384.000000f,18724.572266f,21845.333984f,26214.400391f,
+32768.000000f,37449.144531f,43690.667969f,52428.800781f
+};
+
 void __stdcall guFogGenerateExp(GrFog_t* table, float density) {
-    DG_LOG_STUB("guFogGenerateExp");
-    (void)table; (void)density;
+    /* Per OpenGlide: f = (1 - e^(-density*W)) * scale where scale normalizes to 255 at W(63) */
+    float dpEnd = density * g_fogIndexToW[63];
+    float scale = 255.0f / (1.0f - (float)exp(-dpEnd));
+    int i;
+    if (!table) return;
+    for (i = 0; i < 64; i++) {
+        float dp = density * g_fogIndexToW[i];
+        float f  = (1.0f - (float)exp(-dp)) * scale;
+        if (f > 255.0f) f = 255.0f;
+        else if (f < 0.0f) f = 0.0f;
+        table[i] = (GrFog_t)f;
+    }
+    dg_log("guFogGenerateExp density=%.4f → table[0]=%d table[32]=%d table[63]=%d\n",
+           density, (int)table[0], (int)table[32], (int)table[63]);
 }
 
 void __stdcall guFogGenerateExp2(GrFog_t* table, float density) {
-    DG_LOG_STUB("guFogGenerateExp2");
-    (void)table; (void)density;
+    int i;
+    if (!table) return;
+    for (i = 0; i < 64; i++) {
+        float e  = (float)exp(-density * g_fogIndexToW[i]);
+        float f  = (1.0f - e * e) * 255.0f;
+        if (f > 255.0f) f = 255.0f;
+        else if (f < 0.0f) f = 0.0f;
+        table[i] = (GrFog_t)f;
+    }
+    dg_log("guFogGenerateExp2 density=%.4f\n", density);
 }
 
 void __stdcall guFogGenerateLinear(GrFog_t* table, float nearW, float farW) {
-    DG_LOG_STUB("guFogGenerateLinear");
-    (void)table; (void)nearW; (void)farW;
+    int start, end, i;
+    if (!table) return;
+    for (start = 0; start < 64; start++) if (g_fogIndexToW[start] >= nearW) break;
+    for (end   = 0; end   < 64; end++)   if (g_fogIndexToW[end]   >= farW)  break;
+    memset(table, 0, 64);
+    if (end > start) {
+        for (i = start; i <= end && i < 64; i++) {
+            float f = 255.0f * (float)(i - start) / (float)(end - start);
+            if (f > 255.0f) f = 255.0f;
+            table[i] = (GrFog_t)f;
+        }
+    }
+    for (i = end; i < 64; i++) table[i] = 255;
+    dg_log("guFogGenerateLinear near=%.2f far=%.2f (start=%d end=%d)\n",
+           nearW, farW, start, end);
 }
 
 float __stdcall guFogTableIndexToW(int i) {
-    (void)i;
-    return 1.0f;
+    if (i < 0) i = 0;
+    if (i >= 64) i = 63;
+    return g_fogIndexToW[i];
 }
 
 void __stdcall guMPDrawTriangle(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
