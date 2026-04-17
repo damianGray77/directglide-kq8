@@ -134,6 +134,18 @@ EXE), edit `src/log.c` and change `DG_LOG_ENABLED` to `1`, then rebuild.
   could misclassify it.
 - **No AA draw variants / line drawing**. `grDrawLine`, `grDrawPoint`
   and `grAA*` are routed through the triangle path.
+- **Intro/outro FMV quirks**. KQ8's intro and ending movies are Indeo 5
+  encoded AVIs (`W32opn_1.dll`, `W32ndg_1.dll`, `W32mdl_1.dll`) —
+  Windows 10/11 has dropped the Indeo codec. Users can re-encode to
+  Cinepak with ffmpeg:
+  ```
+  ffmpeg -i W32opn_1.bak.dll -c:v cinepak -q:v 5 -c:a pcm_s16le -f avi W32opn_1.dll
+  ```
+  Even after re-encoding, the "Replay Intro" menu option requires
+  **two clicks** (first click puts game into fullscreen / mode-switch
+  state, second click plays the video) and the video window is not
+  stretched to full screen. These are KQ8 engine quirks on modern
+  Windows, not DirectGlide issues.
 
 ---
 

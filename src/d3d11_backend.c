@@ -375,8 +375,10 @@ static LPARAM translateMouseLParam(LPARAM lParam) {
 }
 
 /* Our wrapper window proc: translate mouse coords, then forward */
+static volatile LONG s_videoPlaying; /* fwd decl — defined fully further down */
+
 static LRESULT CALLBACK dgWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
-    if (g_dg.isOpen) {
+    if (g_dg.isOpen && !s_videoPlaying) {
         switch (msg) {
             case WM_MOUSEMOVE:
             case WM_LBUTTONDOWN: case WM_LBUTTONUP: case WM_LBUTTONDBLCLK:
@@ -401,6 +403,30 @@ static SetCursorPosFn s_origSetCursorPos = NULL;
 static ClipCursorFn   s_origClipCursor   = NULL;
 static ScreenToClientFn s_origScreenToClient = NULL;
 
+/* Tracks whether the game is currently playing an FMV via Video for Windows.
+ * When set, our cursor IAT hooks pass through to the originals without
+ * coordinate translation — KQ8's video playback hangs otherwise. Toggled by
+ * hooks on AVIFileOpenA / AVIFileRelease.  (Forward-decl'd above.) */
+
+typedef HRESULT (WINAPI *AVIFileOpenAFn)(void*, LPCSTR, UINT, LPVOID);
+typedef ULONG   (WINAPI *AVIFileReleaseFn)(void*);
+static AVIFileOpenAFn    s_origAVIFileOpenA    = NULL;
+static AVIFileReleaseFn  s_origAVIFileRelease  = NULL;
+
+static HRESULT WINAPI hookedAVIFileOpenA(void* ppFile, LPCSTR name, UINT mode, LPVOID handler) {
+    InterlockedIncrement(&s_videoPlaying);
+    dg_log("AVI: file open '%s' (videoPlaying=%ld)\n", name ? name : "(null)", s_videoPlaying);
+    return s_origAVIFileOpenA ? s_origAVIFileOpenA(ppFile, name, mode, handler) : E_FAIL;
+}
+
+static ULONG WINAPI hookedAVIFileRelease(void* pFile) {
+    ULONG rc = s_origAVIFileRelease ? s_origAVIFileRelease(pFile) : 0;
+    LONG remaining = InterlockedDecrement(&s_videoPlaying);
+    if (remaining < 0) InterlockedExchange(&s_videoPlaying, 0);
+    dg_log("AVI: file release (videoPlaying=%ld)\n", s_videoPlaying);
+    return rc;
+}
+
 /* Translate game coords -> screen coords */
 static void gameToScreen(int gx, int gy, int* sx, int* sy) {
     int destX, destY, destW, destH;
@@ -410,7 +436,8 @@ static void gameToScreen(int gx, int gy, int* sx, int* sy) {
 }
 
 static BOOL WINAPI hookedSetCursorPos(int x, int y) {
-    if (!g_dg.isOpen) return s_origSetCursorPos ? s_origSetCursorPos(x, y) : SetCursorPos(x, y);
+    if (!g_dg.isOpen || s_videoPlaying)
+        return s_origSetCursorPos ? s_origSetCursorPos(x, y) : SetCursorPos(x, y);
     {
         int sx, sy;
         gameToScreen(x, y, &sx, &sy);
@@ -420,7 +447,7 @@ static BOOL WINAPI hookedSetCursorPos(int x, int y) {
 }
 
 static BOOL WINAPI hookedClipCursor(const RECT* r) {
-    if (!r || !g_dg.isOpen)
+    if (!r || !g_dg.isOpen || s_videoPlaying)
         return s_origClipCursor ? s_origClipCursor(r) : ClipCursor(r);
     {
         RECT sr;
@@ -434,6 +461,7 @@ static BOOL WINAPI hookedClipCursor(const RECT* r) {
 
 static BOOL WINAPI hookedGetCursorPos(LPPOINT pt) {
     BOOL result = s_origGetCursorPos ? s_origGetCursorPos(pt) : GetCursorPos(pt);
+    if (s_videoPlaying) return result; /* video-playback path wants raw coords */
     if (result && pt && g_dg.hwnd && g_dg.isOpen) {
         int destX, destY, destW, destH;
         POINT winPt = *pt;
@@ -498,8 +526,14 @@ static void hookMouseAPIs(void) {
     patchIAT(gameMod, "user32.dll", "GetCursorPos", (FARPROC)hookedGetCursorPos, (FARPROC*)&s_origGetCursorPos);
     patchIAT(gameMod, "user32.dll", "SetCursorPos", (FARPROC)hookedSetCursorPos, (FARPROC*)&s_origSetCursorPos);
     patchIAT(gameMod, "user32.dll", "ClipCursor",   (FARPROC)hookedClipCursor,   (FARPROC*)&s_origClipCursor);
+    /* Hook AVI playback so cursor translation can be bypassed during FMV.
+     * Without this, KQ8 hangs when the game's video path queries cursor. */
+    patchIAT(gameMod, "avifil32.dll", "AVIFileOpenA",   (FARPROC)hookedAVIFileOpenA,   (FARPROC*)&s_origAVIFileOpenA);
+    patchIAT(gameMod, "avifil32.dll", "AVIFileRelease", (FARPROC)hookedAVIFileRelease, (FARPROC*)&s_origAVIFileRelease);
     dg_log("  Mouse IAT hooks: Get=%p Set=%p Clip=%p\n",
            s_origGetCursorPos, s_origSetCursorPos, s_origClipCursor);
+    dg_log("  AVI IAT hooks: Open=%p Release=%p\n",
+           s_origAVIFileOpenA, s_origAVIFileRelease);
 }
 
 int dg_d3d11_init(HWND hwnd, int width, int height) {
@@ -521,20 +555,36 @@ int dg_d3d11_init(HWND hwnd, int width, int height) {
     g_dg.hwnd = hwnd;
     g_dg.width = width;     /* native game resolution — 640x480 */
     g_dg.height = height;
+#if !defined(DG_DISABLE_HOOKS) && !defined(DG_DISABLE_FULLSCREEN)
     g_dg.screenWidth = GetSystemMetrics(SM_CXSCREEN);
     g_dg.screenHeight = GetSystemMetrics(SM_CYSCREEN);
+#else
+    /* Windowed build: keep swap chain at game resolution so KQ8's intro
+     * mode-switches can work without fighting our borderless-fullscreen window. */
+    g_dg.screenWidth = width;
+    g_dg.screenHeight = height;
+#endif
     dg_log("  Screen: %dx%d, game: %dx%d\n", g_dg.screenWidth, g_dg.screenHeight, width, height);
 
-    /* Resize the game window to cover the screen (borderless fullscreen) */
+#if !defined(DG_DISABLE_HOOKS) && !defined(DG_DISABLE_FULLSCREEN)
+    /* Resize the game window to cover the screen (borderless fullscreen).
+     * Skip this if DG_DISABLE_FULLSCREEN is set — some KQ8 features (like the
+     * replay-intro FMV playback) try to change display mode themselves and
+     * hang if the game's window is already a borderless-fullscreen popup. */
     SetWindowLongPtr(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
     SetWindowPos(hwnd, HWND_TOP, 0, 0, g_dg.screenWidth, g_dg.screenHeight,
                  SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+#endif
 
+#if !defined(DG_DISABLE_HOOKS) && !defined(DG_DISABLE_WNDPROC)
     /* Hook the window proc to translate mouse coords from screen to game space */
     g_dg.origWndProc = (WNDPROC)SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)dgWndProc);
     dg_log("  Hooked WndProc (orig=%p)\n", g_dg.origWndProc);
+#endif
+#if !defined(DG_DISABLE_HOOKS) && !defined(DG_DISABLE_IAT_HOOKS)
     /* IAT-patch GetCursorPos in the game EXE to translate screen->game coords */
     hookMouseAPIs();
+#endif
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = 1;
@@ -1642,6 +1692,34 @@ void dg_d3d11_shutdown(void) {
     if (g_dg.origWndProc && g_dg.hwnd) {
         SetWindowLongPtr(g_dg.hwnd, GWLP_WNDPROC, (LONG_PTR)g_dg.origWndProc);
         g_dg.origWndProc = NULL;
+    }
+
+    /* Restore IAT hooks. If the game calls grSstWinOpen again after shutdown
+     * (KQ8 does this for FMV playback), re-running patchIAT without restoring
+     * first would save our own hooks as the "original" and create infinite
+     * recursion on the next cursor call. */
+    {
+        HMODULE gameMod = GetModuleHandleA(NULL);
+        if (s_origGetCursorPos) {
+            patchIAT(gameMod, "user32.dll", "GetCursorPos", (FARPROC)s_origGetCursorPos, NULL);
+            s_origGetCursorPos = NULL;
+        }
+        if (s_origSetCursorPos) {
+            patchIAT(gameMod, "user32.dll", "SetCursorPos", (FARPROC)s_origSetCursorPos, NULL);
+            s_origSetCursorPos = NULL;
+        }
+        if (s_origClipCursor) {
+            patchIAT(gameMod, "user32.dll", "ClipCursor", (FARPROC)s_origClipCursor, NULL);
+            s_origClipCursor = NULL;
+        }
+        if (s_origAVIFileOpenA) {
+            patchIAT(gameMod, "avifil32.dll", "AVIFileOpenA", (FARPROC)s_origAVIFileOpenA, NULL);
+            s_origAVIFileOpenA = NULL;
+        }
+        if (s_origAVIFileRelease) {
+            patchIAT(gameMod, "avifil32.dll", "AVIFileRelease", (FARPROC)s_origAVIFileRelease, NULL);
+            s_origAVIFileRelease = NULL;
+        }
     }
 
     dg_log("  shutdown: hooks restored\n");
