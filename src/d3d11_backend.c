@@ -356,6 +356,26 @@ static void getGameRect(int* destX, int* destY, int* destW, int* destH) {
     *destY = (g_dg.screenHeight - *destH) / 2;
 }
 
+/* Position-dependent 16-bit canary used as LFB "unwritten" marker. Replaces
+ * the old fixed magenta (0xF81F) sentinel which collided with KQ8's own use
+ * of magenta as a "no save preview" placeholder. Because the canary varies
+ * per pixel, the odds that a game-written pixel matches the canary at THAT
+ * SPECIFIC position are ~1/65536 — scattered false positives instead of whole
+ * blocks of mis-classified pixels. */
+static FxU16 lfbCanary(int x, int y) {
+    FxU32 h = ((FxU32)x * 73856093u) ^ ((FxU32)y * 19349663u);
+    h = (h * 0x9E3779B1u) >> 16;
+    return (FxU16)(h | 1); /* avoid 0 so a zeroed buffer reads as "written" */
+}
+
+static void lfbFillCanary(FxU8* buf, FxU32 strideBytes, int w, int h) {
+    int x, y;
+    for (y = 0; y < h; y++) {
+        FxU16* row = (FxU16*)(buf + y * strideBytes);
+        for (x = 0; x < w; x++) row[x] = lfbCanary(x, y);
+    }
+}
+
 /* Translate screen-space mouse (window-client) coords to game coords (640x480) */
 static LPARAM translateMouseLParam(LPARAM lParam) {
     int destX, destY, destW, destH;
@@ -410,8 +430,418 @@ static ScreenToClientFn s_origScreenToClient = NULL;
 
 typedef HRESULT (WINAPI *AVIFileOpenAFn)(void*, LPCSTR, UINT, LPVOID);
 typedef ULONG   (WINAPI *AVIFileReleaseFn)(void*);
+typedef HWND    (WINAPI *CreateWindowExAFn)(DWORD, LPCSTR, LPCSTR, DWORD, int, int, int, int, HWND, HMENU, HINSTANCE, LPVOID);
+typedef HWND    (WINAPI *MCIWndCreateAFn)(HWND, HINSTANCE, DWORD, LPCSTR);
+typedef DWORD   (WINAPI *MciSendCommandAFn)(DWORD, UINT, DWORD_PTR, DWORD_PTR);
+
 static AVIFileOpenAFn    s_origAVIFileOpenA    = NULL;
 static AVIFileReleaseFn  s_origAVIFileRelease  = NULL;
+static CreateWindowExAFn s_origCreateWindowExA = NULL;
+static MCIWndCreateAFn   s_origMCIWndCreateA   = NULL;
+static MciSendCommandAFn s_origMciSendCommandA = NULL;
+
+/* DIAGNOSTIC no-op: two resize approaches both crashed the video playback.
+ * Leave the window alone and verify the video plays at all at native size.
+ * If that works, the proper path is MCIWNDM_PUT_DEST (telling the video
+ * player where to draw) rather than SetWindowPos on its window. */
+static void stretchVideoWindow(HWND vidHwnd) {
+    if (!vidHwnd) return;
+    dg_log("VIDEO: 0x%p — no-op stretch (diagnostic pass)\n", (void*)vidHwnd);
+}
+
+/* Post-creation video stretch via EnumChildWindows. Instead of hooking
+ * MCIWndCreateA (which caused crashes at EIP=0x00400005), observe MCIWnd
+ * windows AFTER they've finished initializing by scanning the game HWND's
+ * children each frame during Present. Tracks already-stretched windows to
+ * avoid flicker/lag from resizing every frame. */
+#ifndef MCIWNDM_PUT_DEST
+#define MCIWNDM_PUT_DEST (WM_USER + 230)
+#endif
+#ifndef MCIWNDM_PUT_SOURCE
+#define MCIWNDM_PUT_SOURCE (WM_USER + 229)
+#endif
+#ifndef MCIWNDM_SETZOOM
+#define MCIWNDM_SETZOOM (WM_USER + 104)
+#endif
+#ifndef MCIWNDM_GETDEVICEID
+#define MCIWNDM_GETDEVICEID (WM_USER + 116)
+#endif
+
+static HWND s_lastStretchedVid = NULL;
+static DWORD s_ourPid = 0;
+static WNDPROC s_origMciProc = NULL;
+static HWND s_subclassedMci = NULL;
+static int s_videoSrcW = 640;
+static int s_videoSrcH = 480;
+
+/* Subclass proc for MCIWnd. Lets the original paint the video at its native
+ * source size into the top-left of the (enlarged) client area, then
+ * StretchBlt-s that region to fill the full client. */
+static LRESULT CALLBACK mciSubclassProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) {
+    WNDPROC orig = s_origMciProc;
+    if (!orig) return DefWindowProcA(hwnd, msg, wp, lp);
+
+    if (msg == WM_ERASEBKGND) {
+        /* Black-fill once on resize (letterbox bars); return 1 to suppress
+         * further erase on this cycle. Video frames draw inside this, so no
+         * per-frame flicker. */
+        HDC dc = (HDC)wp;
+        RECT cr;
+        if (dc && GetClientRect(hwnd, &cr)) {
+            HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
+            FillRect(dc, &cr, bg);
+        }
+        return 1;
+    }
+
+    /* Lock window size to parent client rect — MCIWnd snaps itself back to
+     * native video size (640x480) after we resize it. Rewrite WINDOWPOS in
+     * WM_WINDOWPOSCHANGING so MCIWnd's own resize attempts stay fullscreen. */
+    if (msg == WM_WINDOWPOSCHANGING && lp) {
+        WINDOWPOS* wp2 = (WINDOWPOS*)lp;
+        HWND parent = GetParent(hwnd);
+        RECT pc;
+        if (parent && GetClientRect(parent, &pc)) {
+            int pw = pc.right - pc.left, ph = pc.bottom - pc.top;
+            if (pw > 0 && ph > 0) {
+                if (!(wp2->flags & SWP_NOSIZE)) {
+                    wp2->cx = pw;
+                    wp2->cy = ph;
+                }
+                if (!(wp2->flags & SWP_NOMOVE)) {
+                    wp2->x = 0;
+                    wp2->y = 0;
+                }
+            }
+        }
+    }
+
+    /* WM_PAINT (rarely fires during playback) — stretch if it does. The
+     * real video paints happen from MCI's playback thread via DrawDibDraw,
+     * which we hook separately at the gdi32-import level in msvfw32. */
+    if (msg == WM_PAINT) {
+        RECT cr;
+        int cw, ch, sw, sh;
+        LRESULT ret = CallWindowProcA(orig, hwnd, msg, wp, lp);
+        if (!GetClientRect(hwnd, &cr)) return ret;
+        cw = cr.right - cr.left;
+        ch = cr.bottom - cr.top;
+        sw = s_videoSrcW;
+        sh = s_videoSrcH;
+        if (cw <= sw && ch <= sh) return ret;
+        {
+            HDC dc = GetDC(hwnd);
+            if (dc) {
+                HDC memDc = CreateCompatibleDC(dc);
+                HBITMAP memBmp = CreateCompatibleBitmap(dc, sw, sh);
+                HGDIOBJ oldBmp = SelectObject(memDc, memBmp);
+                int dstX, dstY, dstW, dstH;
+                if ((long long)cw * sh > (long long)ch * sw) {
+                    dstH = ch;
+                    dstW = sw * ch / sh;
+                } else {
+                    dstW = cw;
+                    dstH = sh * cw / sw;
+                }
+                dstX = (cw - dstW) / 2;
+                dstY = (ch - dstH) / 2;
+                BitBlt(memDc, 0, 0, sw, sh, dc, 0, 0, SRCCOPY);
+                {
+                    RECT full; full.left = 0; full.top = 0; full.right = cw; full.bottom = ch;
+                    HBRUSH bg = (HBRUSH)GetStockObject(BLACK_BRUSH);
+                    FillRect(dc, &full, bg);
+                }
+                SetStretchBltMode(dc, HALFTONE);
+                SetBrushOrgEx(dc, 0, 0, NULL);
+                StretchBlt(dc, dstX, dstY, dstW, dstH, memDc, 0, 0, sw, sh, SRCCOPY);
+                SelectObject(memDc, oldBmp);
+                DeleteObject(memBmp);
+                DeleteDC(memDc);
+                ReleaseDC(hwnd, dc);
+            }
+        }
+        return ret;
+    }
+
+    if (msg == WM_NCDESTROY) {
+        /* Restore original WndProc before the window is destroyed. */
+        if (s_subclassedMci == hwnd) {
+            SetWindowLongPtr(hwnd, GWLP_WNDPROC, (LONG_PTR)orig);
+            s_origMciProc = NULL;
+            s_subclassedMci = NULL;
+            s_lastStretchedVid = NULL;
+            dg_log("VIDEO: MCIWnd 0x%p destroyed — subclass removed\n", (void*)hwnd);
+        }
+    }
+
+    return CallWindowProcA(orig, hwnd, msg, wp, lp);
+}
+
+static void stretchMCIWndToTarget(HWND vid, int targetW, int targetH) {
+    RECT wr;
+    POINT origin;
+    HWND parent;
+    int ww, wh;
+    if (!GetWindowRect(vid, &wr)) return;
+    ww = wr.right - wr.left;
+    wh = wr.bottom - wr.top;
+
+    /* Wait until the window reaches a reasonable video-native size before
+     * subclassing — first observation is 300x0 during init, not useful. */
+    if (s_subclassedMci != vid) {
+        if (ww < 64 || wh < 48) return; /* not yet configured */
+        s_videoSrcW = ww;
+        s_videoSrcH = wh;
+
+        {
+            WNDPROC prev = (WNDPROC)SetWindowLongPtr(vid, GWLP_WNDPROC, (LONG_PTR)mciSubclassProc);
+            if (prev) {
+                s_origMciProc = prev;
+                s_subclassedMci = vid;
+                dg_log("VIDEO: subclassed MCIWnd 0x%p (src %dx%d, orig proc=%p)\n",
+                       (void*)vid, s_videoSrcW, s_videoSrcH, (void*)prev);
+            }
+        }
+    }
+
+    /* Move + resize to cover parent client area. */
+    parent = GetParent(vid);
+    origin.x = 0; origin.y = 0;
+    if (!parent) {
+        RECT gr;
+        if (g_dg.hwnd && GetWindowRect(g_dg.hwnd, &gr)) {
+            origin.x = gr.left;
+            origin.y = gr.top;
+        }
+    }
+
+    if (ww == targetW && wh == targetH && wr.left == origin.x && wr.top == origin.y)
+        return;
+
+    dg_log("VIDEO: sizing MCIWnd 0x%p from (%d,%d %dx%d) to (%d,%d %dx%d)\n",
+           (void*)vid, wr.left, wr.top, ww, wh, origin.x, origin.y, targetW, targetH);
+    SetWindowPos(vid, HWND_TOP, origin.x, origin.y, targetW, targetH,
+                 SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_SHOWWINDOW);
+    InvalidateRect(vid, NULL, TRUE);
+}
+
+static BOOL CALLBACK enumVideoAnyProc(HWND hwnd, LPARAM lParam) {
+    char cls[64];
+    DWORD pid = 0;
+    RECT pc;
+    HWND parent;
+    (void)lParam;
+
+    GetWindowThreadProcessId(hwnd, &pid);
+    if (pid != s_ourPid) return TRUE;
+    if (GetClassNameA(hwnd, cls, (int)sizeof(cls)) <= 0) return TRUE;
+    if (strcmp(cls, "MCIWndClass") != 0) return TRUE;
+
+    /* Target size: parent client rect if parented, else our game window client. */
+    parent = GetParent(hwnd);
+    if (!parent) parent = g_dg.hwnd;
+    if (!parent || !GetClientRect(parent, &pc)) return TRUE;
+    if (pc.right - pc.left <= 0 || pc.bottom - pc.top <= 0) return TRUE;
+
+    /* Always re-check and re-stretch every poll — MCIWnd may snap window
+     * back to video native size once the file loads, so a one-shot stretch
+     * doesn't stick. */
+    stretchMCIWndToTarget(hwnd, pc.right - pc.left, pc.bottom - pc.top);
+    s_lastStretchedVid = hwnd;
+    return TRUE;
+}
+
+static void scanForVideoChildren(HWND parent) {
+    (void)parent;
+    if (!s_ourPid) s_ourPid = GetCurrentProcessId();
+    /* Scan all top-level windows in the process; MCIWnd may be top-level or
+     * parented to something other than our game HWND. */
+    EnumWindows(enumVideoAnyProc, 0);
+    /* Also scan children of the game window in case MCIWnd is nested. */
+    if (g_dg.hwnd) EnumChildWindows(g_dg.hwnd, enumVideoAnyProc, 0);
+}
+
+/* Forward decl — defined later alongside mouse hook infrastructure. */
+static void patchIAT(HMODULE hModule, const char* dllName, const char* funcName, FARPROC newFunc, FARPROC* origFunc);
+
+/* ============================================================
+ * msvfw32 gdi IAT hooks for FMV fullscreen stretching
+ * ============================================================
+ * The real video frame paints happen from MCI's playback thread via
+ * msvfw32!DrawDibDraw, which ultimately calls gdi32!SetDIBitsToDevice
+ * (no-stretch) or StretchDIBits. By IAT-patching msvfw32's imports from
+ * gdi32 we intercept the pixel transfer and redirect it to a stretched
+ * destination that fills our resized MCIWnd's client area. */
+typedef int (WINAPI *SetDIBitsToDeviceFn)(HDC, int, int, DWORD, DWORD, int, int, UINT, UINT,
+    const VOID*, const BITMAPINFO*, UINT);
+typedef int (WINAPI *StretchDIBitsFn)(HDC, int, int, int, int, int, int, int, int,
+    const VOID*, const BITMAPINFO*, UINT, DWORD);
+typedef BOOL (WINAPI *BitBltFn)(HDC, int, int, int, int, HDC, int, int, DWORD);
+typedef BOOL (WINAPI *StretchBltFn)(HDC, int, int, int, int, HDC, int, int, int, int, DWORD);
+
+static SetDIBitsToDeviceFn s_origSetDIBitsToDevice = NULL;
+static StretchDIBitsFn s_origStretchDIBits = NULL;
+static BitBltFn s_origBitBlt = NULL;
+static StretchBltFn s_origStretchBlt = NULL;
+static int s_msvfwHooked = 0;
+
+/* Compute aspect-preserved letterbox dst rect within client size (cw,ch)
+ * for a source of size (sw,sh). Writes outputs via pointers. */
+static void letterboxFit(int cw, int ch, int sw, int sh,
+                          int* dstX, int* dstY, int* dstW, int* dstH) {
+    if (sw <= 0 || sh <= 0) { *dstX = 0; *dstY = 0; *dstW = cw; *dstH = ch; return; }
+    if ((long long)cw * sh > (long long)ch * sw) {
+        *dstH = ch;
+        *dstW = (int)((long long)sw * ch / sh);
+    } else {
+        *dstW = cw;
+        *dstH = (int)((long long)sh * cw / sw);
+    }
+    *dstX = (cw - *dstW) / 2;
+    *dstY = (ch - *dstH) / 2;
+}
+
+static int WINAPI hookedSetDIBitsToDevice(HDC hdc, int x, int y, DWORD w, DWORD h,
+    int xs, int ys, UINT ss, UINT cl, const VOID* bits, const BITMAPINFO* bmi, UINT usage) {
+    HWND hwndDC = WindowFromDC(hdc);
+    if (hwndDC && hwndDC == s_subclassedMci && s_origStretchDIBits) {
+        RECT cr;
+        if (GetClientRect(hwndDC, &cr)) {
+            int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+            if (cw > (int)w || ch > (int)h) {
+                int dx, dy, dw, dh;
+                letterboxFit(cw, ch, (int)w, (int)h, &dx, &dy, &dw, &dh);
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, NULL);
+                return s_origStretchDIBits(hdc, dx, dy, dw, dh, xs, ys, (int)w, (int)h,
+                                            bits, bmi, usage, SRCCOPY);
+            }
+        }
+    }
+    return s_origSetDIBitsToDevice
+        ? s_origSetDIBitsToDevice(hdc, x, y, w, h, xs, ys, ss, cl, bits, bmi, usage)
+        : 0;
+}
+
+static int WINAPI hookedStretchDIBits(HDC hdc, int xd, int yd, int dw, int dh,
+    int xs, int ys, int sw, int sh, const VOID* bits, const BITMAPINFO* bmi,
+    UINT usage, DWORD rop) {
+    HWND hwndDC = WindowFromDC(hdc);
+    if (hwndDC && hwndDC == s_subclassedMci) {
+        RECT cr;
+        if (GetClientRect(hwndDC, &cr)) {
+            int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+            if (cw > dw || ch > dh) {
+                int ndx, ndy, ndw, ndh;
+                letterboxFit(cw, ch, sw, sh, &ndx, &ndy, &ndw, &ndh);
+                SetStretchBltMode(hdc, HALFTONE);
+                SetBrushOrgEx(hdc, 0, 0, NULL);
+                xd = ndx; yd = ndy; dw = ndw; dh = ndh;
+            }
+        }
+    }
+    return s_origStretchDIBits
+        ? s_origStretchDIBits(hdc, xd, yd, dw, dh, xs, ys, sw, sh, bits, bmi, usage, rop)
+        : 0;
+}
+
+static BOOL WINAPI hookedBitBlt(HDC hdcDst, int x, int y, int cx, int cy,
+                                 HDC hdcSrc, int x1, int y1, DWORD rop) {
+    HWND hwndDC = WindowFromDC(hdcDst);
+    if (hwndDC && hwndDC == s_subclassedMci && s_origStretchBlt) {
+        RECT cr;
+        if (GetClientRect(hwndDC, &cr)) {
+            int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+            if (cw > cx || ch > cy) {
+                int dx, dy, dw, dh;
+                letterboxFit(cw, ch, cx, cy, &dx, &dy, &dw, &dh);
+                SetStretchBltMode(hdcDst, HALFTONE);
+                SetBrushOrgEx(hdcDst, 0, 0, NULL);
+                return s_origStretchBlt(hdcDst, dx, dy, dw, dh, hdcSrc, x1, y1, cx, cy, rop);
+            }
+        }
+    }
+    return s_origBitBlt ? s_origBitBlt(hdcDst, x, y, cx, cy, hdcSrc, x1, y1, rop) : FALSE;
+}
+
+static BOOL WINAPI hookedStretchBlt(HDC hdcDst, int x, int y, int cx, int cy,
+                                     HDC hdcSrc, int x1, int y1, int cx1, int cy1, DWORD rop) {
+    HWND hwndDC = WindowFromDC(hdcDst);
+    if (hwndDC && hwndDC == s_subclassedMci) {
+        RECT cr;
+        if (GetClientRect(hwndDC, &cr)) {
+            int cw = cr.right - cr.left, ch = cr.bottom - cr.top;
+            if (cw > cx || ch > cy) {
+                int dx, dy, dw, dh;
+                letterboxFit(cw, ch, cx1, cy1, &dx, &dy, &dw, &dh);
+                SetStretchBltMode(hdcDst, HALFTONE);
+                SetBrushOrgEx(hdcDst, 0, 0, NULL);
+                x = dx; y = dy; cx = dw; cy = dh;
+            }
+        }
+    }
+    return s_origStretchBlt
+        ? s_origStretchBlt(hdcDst, x, y, cx, cy, hdcSrc, x1, y1, cx1, cy1, rop)
+        : FALSE;
+}
+
+static void tryHookMsvfw32(void) {
+    HMODULE mod;
+    if (s_msvfwHooked) return;
+    mod = GetModuleHandleA("msvfw32.dll");
+    if (!mod) return;
+    patchIAT(mod, "gdi32.dll", "SetDIBitsToDevice",
+             (FARPROC)hookedSetDIBitsToDevice, (FARPROC*)&s_origSetDIBitsToDevice);
+    patchIAT(mod, "gdi32.dll", "StretchDIBits",
+             (FARPROC)hookedStretchDIBits, (FARPROC*)&s_origStretchDIBits);
+    patchIAT(mod, "gdi32.dll", "BitBlt",
+             (FARPROC)hookedBitBlt, (FARPROC*)&s_origBitBlt);
+    patchIAT(mod, "gdi32.dll", "StretchBlt",
+             (FARPROC)hookedStretchBlt, (FARPROC*)&s_origStretchBlt);
+    s_msvfwHooked = 1;
+    dg_log("VIDEO: msvfw32 IAT hooked SetDIB=%p StretchDIB=%p BitBlt=%p StretchBlt=%p\n",
+           s_origSetDIBitsToDevice, s_origStretchDIBits, s_origBitBlt, s_origStretchBlt);
+}
+
+/* Background watcher thread: polls for MCIWnd windows regardless of whether
+ * grBufferSwap is being called. KQ8 stops rendering during FMV playback so
+ * the present-loop scan can't see the video window. */
+static volatile LONG s_videoWatcherStop = 0;
+static HANDLE s_videoWatcherThread = NULL;
+
+static DWORD WINAPI videoWatcherProc(LPVOID arg) {
+    (void)arg;
+    dg_log("VIDEO: watcher thread started\n");
+    while (!s_videoWatcherStop) {
+        if (g_dg.isOpen) {
+            tryHookMsvfw32();
+            scanForVideoChildren(g_dg.hwnd);
+            if (s_lastStretchedVid && !IsWindow(s_lastStretchedVid)) {
+                s_lastStretchedVid = NULL;
+            }
+        }
+        Sleep(50);
+    }
+    dg_log("VIDEO: watcher thread exiting\n");
+    return 0;
+}
+
+static void startVideoWatcher(void) {
+    DWORD tid;
+    if (s_videoWatcherThread) return;
+    s_videoWatcherStop = 0;
+    s_videoWatcherThread = CreateThread(NULL, 0, videoWatcherProc, NULL, 0, &tid);
+    dg_log("VIDEO: watcher thread create -> %p (tid=%lu)\n",
+           (void*)s_videoWatcherThread, tid);
+}
+
+static void stopVideoWatcher(void) {
+    if (!s_videoWatcherThread) return;
+    InterlockedExchange(&s_videoWatcherStop, 1);
+    WaitForSingleObject(s_videoWatcherThread, 500);
+    CloseHandle(s_videoWatcherThread);
+    s_videoWatcherThread = NULL;
+}
 
 static HRESULT WINAPI hookedAVIFileOpenA(void* ppFile, LPCSTR name, UINT mode, LPVOID handler) {
     InterlockedIncrement(&s_videoPlaying);
@@ -424,6 +854,43 @@ static ULONG WINAPI hookedAVIFileRelease(void* pFile) {
     LONG remaining = InterlockedDecrement(&s_videoPlaying);
     if (remaining < 0) InterlockedExchange(&s_videoPlaying, 0);
     dg_log("AVI: file release (videoPlaying=%ld)\n", s_videoPlaying);
+    return rc;
+}
+
+static HWND WINAPI hookedMCIWndCreateA(HWND parent, HINSTANCE inst, DWORD style, LPCSTR file) {
+    /* Pure pass-through. Tried various manipulations (resize, style change,
+     * returning NULL) to get KQ8's intro FMV to work on modern Windows —
+     * all paths crash or hang at EIP=0x00400005 (inside KQ8's own PE header,
+     * an indirect call through a corrupt pointer). The intro-replay path is
+     * broken inside KQ8 itself. Documented as a known limitation. */
+    dg_log("MCIWnd: create parent=0x%p style=0x%08X file='%s' (passthrough)\n",
+           (void*)parent, style, file ? file : "(null)");
+    return s_origMCIWndCreateA ? s_origMCIWndCreateA(parent, inst, style, file) : NULL;
+}
+
+static DWORD WINAPI hookedMciSendCommandA(DWORD dev, UINT cmd, DWORD_PTR p1, DWORD_PTR p2) {
+    dg_log("MCI: sendCommand dev=%u cmd=0x%X p1=0x%p p2=0x%p\n",
+           dev, cmd, (void*)p1, (void*)p2);
+    return s_origMciSendCommandA ? s_origMciSendCommandA(dev, cmd, p1, p2) : 0;
+}
+
+static HWND WINAPI hookedCreateWindowExA(DWORD exStyle, LPCSTR className, LPCSTR winName,
+                                          DWORD style, int x, int y, int width, int height,
+                                          HWND parent, HMENU menu, HINSTANCE inst, LPVOID param) {
+    HWND rc = s_origCreateWindowExA ? s_origCreateWindowExA(exStyle, className, winName,
+        style, x, y, width, height, parent, menu, inst, param) : NULL;
+    if (rc && className) {
+        /* className is either a string pointer or a registered class atom
+         * (a small integer 0x0000..0xFFFF). Only interpret as string if > 0xFFFF. */
+        int isString = (((ULONG_PTR)className) > 0xFFFF);
+        const char* cn = isString ? className : "(atom)";
+        dg_log("CreateWindowEx: cls='%s' name='%s' style=0x%08X size=%dx%d -> 0x%p\n",
+               cn, winName ? winName : "(null)", style, width, height, (void*)rc);
+        /* MCIWnd windows use class "MCIWndClass" */
+        if (isString && strcmp(className, "MCIWndClass") == 0) {
+            stretchVideoWindow(rc);
+        }
+    }
     return rc;
 }
 
@@ -530,6 +997,10 @@ static void hookMouseAPIs(void) {
      * Without this, KQ8 hangs when the game's video path queries cursor. */
     patchIAT(gameMod, "avifil32.dll", "AVIFileOpenA",   (FARPROC)hookedAVIFileOpenA,   (FARPROC*)&s_origAVIFileOpenA);
     patchIAT(gameMod, "avifil32.dll", "AVIFileRelease", (FARPROC)hookedAVIFileRelease, (FARPROC*)&s_origAVIFileRelease);
+    /* Video-window-stretch hooks DISABLED — adding CreateWindowExA/MCIWndCreateA
+     * hooks broke previously-working video playback (intro now crashes or hangs
+     * instead of playing at native size). The stretch-to-fullscreen is not
+     * worth the regression. Restore video to last-night's working baseline. */
     dg_log("  Mouse IAT hooks: Get=%p Set=%p Clip=%p\n",
            s_origGetCursorPos, s_origSetCursorPos, s_origClipCursor);
     dg_log("  AVI IAT hooks: Open=%p Release=%p\n",
@@ -585,6 +1056,11 @@ int dg_d3d11_init(HWND hwnd, int width, int height) {
     /* IAT-patch GetCursorPos in the game EXE to translate screen->game coords */
     hookMouseAPIs();
 #endif
+
+    /* Start background watcher for MCIWnd video windows (stretches intro FMV
+     * to fullscreen). KQ8 stops calling grBufferSwap during video, so we can't
+     * rely on the present loop to scan. */
+    startVideoWatcher();
 
     memset(&scd, 0, sizeof(scd));
     scd.BufferCount = 1;
@@ -1071,23 +1547,29 @@ fail:
 
 static D3D11_BLEND mapBlend(int glideBlend, int isSrc) {
     /*
-     * Glide blend values (from real SDK):
-     * 0 = ZERO
-     * 1 = DST_COLOR(src) / SRC_COLOR(dst) - context dependent
-     * 2 = SRC_COLOR (dst only, rarely used for src)
-     * 3 = ONE_MINUS_SRC_COLOR / ONE_MINUS_DST_COLOR
-     * 4 = ONE (also SRC_ALPHA — same value in Glide, treat as ONE)
-     * 5 = ONE_MINUS_SRC_ALPHA
-     * 6 = DST_ALPHA
-     * 7 = ONE_MINUS_DST_ALPHA
-     * F = ALPHA_SATURATE
+     * Glide blend values (from sdk2_glide.h):
+     *   0 = ZERO
+     *   1 = ONE / DST_COLOR (same value — "ONE" for dst factor, "DST_COLOR" for src)
+     *   2 = SRC_COLOR (only valid as dst factor)
+     *   3 = ONE_MINUS_SRC_COLOR / ONE_MINUS_DST_COLOR (context-dependent)
+     *   4 = SRC_ALPHA
+     *   5 = ONE_MINUS_SRC_ALPHA
+     *   6 = DST_ALPHA
+     *   7 = ONE_MINUS_DST_ALPHA
+     *   F = ALPHA_SATURATE / PREFOG_COLOR
      */
     switch (glideBlend) {
         case 0x0: return D3D11_BLEND_ZERO;
-        case 0x1: return isSrc ? D3D11_BLEND_DEST_COLOR : D3D11_BLEND_SRC_COLOR;
+        case 0x1: return isSrc ? D3D11_BLEND_DEST_COLOR : D3D11_BLEND_ONE;
         case 0x2: return D3D11_BLEND_SRC_COLOR;
         case 0x3: return isSrc ? D3D11_BLEND_INV_DEST_COLOR : D3D11_BLEND_INV_SRC_COLOR;
-        case 0x4: return D3D11_BLEND_ONE;  /* ONE and SRC_ALPHA share value 4; default to ONE */
+        case 0x4: return D3D11_BLEND_ONE;  /* Glide spec says SRC_ALPHA, but our
+                                            * alpha combiner pipeline emits low
+                                            * alpha for opaque pixels; mapping
+                                            * to ONE is an incidental workaround
+                                            * that keeps KQ8 looking correct.
+                                            * Proper fix requires auditing the
+                                            * alpha combiner to match the spec. */
         case 0x5: return D3D11_BLEND_INV_SRC_ALPHA;
         case 0x6: return D3D11_BLEND_DEST_ALPHA;
         case 0x7: return D3D11_BLEND_INV_DEST_ALPHA;
@@ -1440,13 +1922,10 @@ void dg_d3d11_present(int swapInterval) {
     ID3D11DeviceContext_OMSetRenderTargets(g_dg.context, 1, &g_dg.gameRtv, g_dg.dsv);
 
     /* Wipe LFB only if the game actually wrote to it this frame (locked).
-     * If the game didn't touch LFB, its content is still valid from the
-     * previous frame — wiping would destroy static overlays (XP bar, etc)
-     * that the game doesn't redraw every frame. */
+     * Fill with position-dependent canaries so unwritten pixels can be
+     * detected without color collisions with game-written content. */
     if (g_dg.drewThisFrame && g_dg.lfbLockedThisFrame && g_dg.lfbCpuBuffer) {
-        FxU16* p = (FxU16*)g_dg.lfbCpuBuffer;
-        int i, count = g_dg.width * g_dg.height;
-        for (i = 0; i < count; i++) p[i] = 0xF81F;
+        lfbFillCanary(g_dg.lfbCpuBuffer, (FxU32)(g_dg.width * 2), g_dg.width, g_dg.height);
     }
     g_dg.lfbLockedThisFrame = 0;
     g_dg.drewThisFrame = 0;
@@ -1465,12 +1944,11 @@ void dg_d3d11_clear(float r, float g, float b, float a, float depth) {
     if (g_dg.dsv)
         ID3D11DeviceContext_ClearDepthStencilView(g_dg.context, g_dg.dsv, D3D11_CLEAR_DEPTH, depth, 0);
 
-    /* Clear LFB on grBufferClear — fill with magenta sentinel so 3D shows through
-     * unwritten pixels but legitimate black HUD pixels still render opaque. */
+    /* Clear LFB on grBufferClear — fill with position-dependent canary pattern
+     * so unwritten pixels are detectable without conflicting with legitimate
+     * game colors (e.g. KQ8 uses magenta 0xF81F as a "no save preview" color). */
     if (g_dg.lfbCpuBuffer) {
-        FxU16* p = (FxU16*)g_dg.lfbCpuBuffer;
-        int i, count = g_dg.width * g_dg.height;
-        for (i = 0; i < count; i++) p[i] = 0xF81F;
+        lfbFillCanary(g_dg.lfbCpuBuffer, (FxU32)(g_dg.width * 2), g_dg.width, g_dg.height);
     }
     /* Also clear the HUD stable buffer — scene transitions should dump accumulated
      * HUD overlays (see dg_lfb_flush for what lfbStable is). */
@@ -1553,6 +2031,148 @@ void* dg_lfb_lock(GrLfbWriteMode_t writeMode, FxU32* outStride) {
 
 void dg_lfb_unlock(void) { /* flush on present */ }
 
+/* Read a region of the current backbuffer back as RGB565 pixels. Used by
+ * KQ8 when saving a game to capture a thumbnail of the current scene. */
+int dg_lfb_read_region(FxU32 srcX, FxU32 srcY, FxU32 srcW, FxU32 srcH,
+                        FxU32 dstStride, void* dst) {
+    D3D11_TEXTURE2D_DESC td;
+    D3D11_MAPPED_SUBRESOURCE mapped;
+    ID3D11Texture2D* staging = NULL;
+    HRESULT hr;
+    FxU32 y, x;
+    FxU8* dstBytes = (FxU8*)dst;
+    int factor;
+
+    if (!g_dg.isOpen || !g_dg.gameTex || !dst) return 0;
+    if (srcW == 0 || srcH == 0) return 1;
+
+    factor = g_dg.ssaaFactor > 0 ? g_dg.ssaaFactor : 1;
+
+    /* Create a CPU-readable staging texture matching gameTex dims. */
+    memset(&td, 0, sizeof(td));
+    td.Width         = (UINT)g_dg.ssaaWidth;
+    td.Height        = (UINT)g_dg.ssaaHeight;
+    td.MipLevels     = 1;
+    td.ArraySize     = 1;
+    td.Format        = DXGI_FORMAT_R8G8B8A8_UNORM;
+    td.SampleDesc.Count = 1;
+    td.Usage         = D3D11_USAGE_STAGING;
+    td.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    hr = ID3D11Device_CreateTexture2D(g_dg.device, &td, NULL, &staging);
+    if (FAILED(hr)) { dg_log("ReadRegion: CreateTexture2D failed 0x%08X\n", hr); return 0; }
+
+    ID3D11DeviceContext_CopyResource(g_dg.context,
+        (ID3D11Resource*)staging, (ID3D11Resource*)g_dg.gameTex);
+
+    hr = ID3D11DeviceContext_Map(g_dg.context, (ID3D11Resource*)staging,
+                                  0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        ID3D11Texture2D_Release(staging);
+        dg_log("ReadRegion: Map failed 0x%08X\n", hr);
+        return 0;
+    }
+
+    for (y = 0; y < srcH; y++) {
+        FxU16* dstRow = (FxU16*)(dstBytes + y * dstStride);
+        FxU32 ssaaY = (srcY + y) * factor;
+        FxU8* srcRow;
+        if (ssaaY >= (FxU32)g_dg.ssaaHeight) break;
+        srcRow = (FxU8*)mapped.pData + ssaaY * mapped.RowPitch;
+        for (x = 0; x < srcW; x++) {
+            FxU32 ssaaX = (srcX + x) * factor;
+            FxU8* px;
+            FxU16 r5, g6, b5;
+            if (ssaaX >= (FxU32)g_dg.ssaaWidth) break;
+            px = srcRow + ssaaX * 4;
+            /* R8G8B8A8_UNORM stores bytes as R,G,B,A in memory. */
+            r5 = (FxU16)(px[0] >> 3);
+            g6 = (FxU16)(px[1] >> 2);
+            b5 = (FxU16)(px[2] >> 3);
+            dstRow[x] = (FxU16)((r5 << 11) | (g6 << 5) | b5);
+        }
+    }
+
+    ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)staging, 0);
+    ID3D11Texture2D_Release(staging);
+    return 1;
+}
+
+/* Write a region of pixels into our LFB buffer, to be composited on the
+ * next frame. Used by KQ8 to blit saved thumbnails on the save/load screen. */
+int dg_lfb_write_region(FxU32 dstX, FxU32 dstY, GrLfbWriteMode_t writeMode,
+                         FxU32 srcW, FxU32 srcH, FxU32 srcStride, const void* src) {
+    FxU32 y, x;
+    const FxU8* srcBytes = (const FxU8*)src;
+    FxU32 lfbStride;
+
+    if (!g_dg.isOpen || !g_dg.lfbCpuBuffer || !src) return 0;
+    if (srcW == 0 || srcH == 0) return 1;
+
+    /* WriteRegion always targets the native 565 LFB so dg_lfb_flush can
+     * composite it correctly. Force stride to match. */
+    lfbStride = (FxU32)(g_dg.width * 2);
+    g_dg.lfbStride = lfbStride;
+    g_dg.lfbWriteMode = GR_LFBWRITEMODE_565;
+    g_dg.lfbDirty = 1;
+    g_dg.lfbLockedThisFrame = 1;
+
+    for (y = 0; y < srcH; y++) {
+        int rowY = (int)(dstY + y);
+        FxU16* dstRow;
+        const FxU8* srcRow;
+        if (rowY < 0 || rowY >= g_dg.height) continue;
+        dstRow = (FxU16*)(g_dg.lfbCpuBuffer + rowY * lfbStride);
+        srcRow = srcBytes + y * srcStride;
+
+        for (x = 0; x < srcW; x++) {
+            int colX = (int)(dstX + x);
+            FxU16 pix565 = 0;
+            if (colX < 0 || colX >= g_dg.width) continue;
+
+            switch (writeMode) {
+                case GR_LFBWRITEMODE_565:
+                    pix565 = ((const FxU16*)srcRow)[x];
+                    break;
+                case GR_LFBWRITEMODE_555: {
+                    FxU16 p = ((const FxU16*)srcRow)[x];
+                    FxU16 r5 = (FxU16)((p >> 10) & 0x1F);
+                    FxU16 g5 = (FxU16)((p >>  5) & 0x1F);
+                    FxU16 b5 = (FxU16)( p        & 0x1F);
+                    FxU16 g6 = (FxU16)((g5 << 1) | (g5 >> 4));
+                    pix565 = (FxU16)((r5 << 11) | (g6 << 5) | b5);
+                    break;
+                }
+                case GR_LFBWRITEMODE_1555: {
+                    FxU16 p = ((const FxU16*)srcRow)[x];
+                    FxU16 r5 = (FxU16)((p >> 10) & 0x1F);
+                    FxU16 g5 = (FxU16)((p >>  5) & 0x1F);
+                    FxU16 b5 = (FxU16)( p        & 0x1F);
+                    FxU16 g6 = (FxU16)((g5 << 1) | (g5 >> 4));
+                    pix565 = (FxU16)((r5 << 11) | (g6 << 5) | b5);
+                    break;
+                }
+                case GR_LFBWRITEMODE_888: {
+                    const FxU8* p = srcRow + x * 3;
+                    /* 3dfx 888: b,g,r in memory order. */
+                    pix565 = (FxU16)(((p[2] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[0] >> 3));
+                    break;
+                }
+                case GR_LFBWRITEMODE_8888: {
+                    const FxU8* p = srcRow + x * 4;
+                    /* 3dfx 8888: b,g,r,a in memory order. */
+                    pix565 = (FxU16)(((p[2] & 0xF8) << 8) | ((p[1] & 0xFC) << 3) | (p[0] >> 3));
+                    break;
+                }
+                default:
+                    pix565 = ((const FxU16*)srcRow)[x];
+                    break;
+            }
+            dstRow[colX] = pix565;
+        }
+    }
+    return 1;
+}
+
 void dg_lfb_flush(void) {
     D3D11_MAPPED_SUBRESOURCE mapped;
     HRESULT hr;
@@ -1593,33 +2213,39 @@ void dg_lfb_flush(void) {
              *   elements (cursor, dialogue modals, subtitles) always appear
              *   somewhere in the interior of the screen.
              *
-             * So we probe the leftmost column of the LFB each flush. Where it's
-             * non-sentinel, we know we're inside a HUD bar. That gives us the
-             * topHudBottom and bottomHudTop Y-coordinates.
+             * We probe the LEFTMOST and RIGHTMOST columns each flush. A row
+             * is classified as HUD only if BOTH edges are non-canary — i.e. a
+             * bar spans the full width. Partial overlays (e.g. KQ8's map which
+             * slides in from the left side only) won't match both criteria and
+             * are handled as normal 3D-viewport rows.
              *
-             * For rows inside the HUD bar region, we accumulate non-sentinel
-             * pixels into `lfbStable` — a persistent buffer that's only reset
-             * on grBufferClear. Those accumulated pixels are used for the final
-             * composite regardless of whether the game redrew them this frame.
+             * For HUD rows, we accumulate written pixels into `lfbStable` — a
+             * persistent buffer reset only on grBufferClear — and composite
+             * from that, so static overlays (XP bar, icon decorations) survive
+             * even when the game doesn't redraw them every frame.
              *
-             * Rows OUTSIDE the HUD region (the interior 3D viewport) use the
-             * normal sentinel-handling path, so dynamic elements continue to
-             * wipe cleanly between frames.
+             * "Unwritten" pixels are detected via a position-dependent canary
+             * instead of a fixed magenta sentinel, avoiding color collisions
+             * (KQ8 uses 0xF81F itself as a "no save preview" placeholder).
              * ----------------------------------------------------------------------- */
-            const FxU16 SENTINEL = 0xF81F;
             int is3dFrame = g_dg.drewThisFrame;
             int topHudBottom = 0;    /* HUD occupies y < topHudBottom */
             int bottomHudTop = g_dg.height; /* HUD occupies y >= bottomHudTop */
+            int lastX = g_dg.width - 1;
 
-            /* Probe left column to find HUD extents */
+            /* Probe both edges; row only counts as HUD if both sides are non-canary */
             for (y = 0; y < g_dg.height; y++) {
-                FxU16 c = ((FxU16*)(src + y * g_dg.lfbStride))[0];
-                if (c == SENTINEL) break;
+                FxU16* row = (FxU16*)(src + y * g_dg.lfbStride);
+                int leftWritten  = (row[0]     != lfbCanary(0,     y));
+                int rightWritten = (row[lastX] != lfbCanary(lastX, y));
+                if (!(leftWritten && rightWritten)) break;
                 topHudBottom = y + 1;
             }
             for (y = g_dg.height - 1; y >= 0; y--) {
-                FxU16 c = ((FxU16*)(src + y * g_dg.lfbStride))[0];
-                if (c == SENTINEL) break;
+                FxU16* row = (FxU16*)(src + y * g_dg.lfbStride);
+                int leftWritten  = (row[0]     != lfbCanary(0,     y));
+                int rightWritten = (row[lastX] != lfbCanary(lastX, y));
+                if (!(leftWritten && rightWritten)) break;
                 bottomHudTop = y;
             }
 
@@ -1629,12 +2255,11 @@ void dg_lfb_flush(void) {
                 int inHud = (y < topHudBottom) || (y >= bottomHudTop);
 
                 if (inHud) {
-                    /* HUD row: merge any non-sentinel pixels this frame into the
-                     * persistent stable buffer, then use lfbStable for display. */
+                    /* HUD row: merge written pixels into stable, output stable. */
                     FxU32* stableRow = g_dg.lfbStable + y * g_dg.width;
                     for (x = 0; x < g_dg.width; x++) {
                         FxU16 c = srcRow[x];
-                        if (c != SENTINEL) {
+                        if (c != lfbCanary(x, y)) {
                             FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
                             FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
                             FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
@@ -1643,10 +2268,10 @@ void dg_lfb_flush(void) {
                         dstRow[x] = stableRow[x];
                     }
                 } else {
-                    /* 3D-viewport row: regular sentinel handling. */
+                    /* Viewport / partial-overlay row: no persistence. */
                     for (x = 0; x < g_dg.width; x++) {
                         FxU16 c = srcRow[x];
-                        if (c == SENTINEL) {
+                        if (c == lfbCanary(x, y)) {
                             dstRow[x] = is3dFrame ? 0x00000000 : 0xFF000000;
                         } else {
                             FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
@@ -1688,6 +2313,9 @@ void dg_d3d11_shutdown(void) {
     /* Mark closed FIRST so hooks stop translating */
     g_dg.isOpen = 0;
 
+    /* Stop the video watcher thread before we tear anything else down. */
+    stopVideoWatcher();
+
     /* Restore original WndProc so our proc doesn't get called after DLL unload */
     if (g_dg.origWndProc && g_dg.hwnd) {
         SetWindowLongPtr(g_dg.hwnd, GWLP_WNDPROC, (LONG_PTR)g_dg.origWndProc);
@@ -1720,6 +2348,7 @@ void dg_d3d11_shutdown(void) {
             patchIAT(gameMod, "avifil32.dll", "AVIFileRelease", (FARPROC)s_origAVIFileRelease, NULL);
             s_origAVIFileRelease = NULL;
         }
+        /* Video-stretch hooks were disabled — nothing to un-hook here. */
     }
 
     dg_log("  shutdown: hooks restored\n");

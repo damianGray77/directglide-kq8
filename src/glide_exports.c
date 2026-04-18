@@ -640,10 +640,19 @@ FxBool __stdcall grLfbLock(GrLock_t type, GrBuffer_t buffer,
     FxU32 stride = 0;
     void* ptr;
     DG_LOG_ONCE("grLfbLock");
-    (void)type; (void)buffer; (void)origin; (void)pixelPipeline;
+    (void)buffer; (void)origin; (void)pixelPipeline;
 
     ptr = dg_lfb_lock(writeMode, &stride);
     if (!ptr) return FXFALSE;
+
+    /* If game wants to READ the framebuffer (e.g., to capture a save-file
+     * thumbnail of the current 3D scene), populate the buffer with current
+     * gameTex contents as RGB565. Without this, the game reads our canary
+     * pattern and stores garbage in the save file. */
+    if ((type & GR_LFB_WRITE_ONLY) == 0) {
+        dg_lfb_read_region(0, 0, (FxU32)g_dg.width, (FxU32)g_dg.height,
+                            (FxU32)(g_dg.width * 2), ptr);
+    }
 
     if (info) {
         info->size = sizeof(GrLfbInfo_t);
@@ -664,19 +673,19 @@ FxBool __stdcall grLfbUnlock(GrLock_t type, GrBuffer_t buffer) {
 
 FxBool __stdcall grLfbReadRegion(GrBuffer_t buffer, FxU32 srcX, FxU32 srcY,
                                   FxU32 srcW, FxU32 srcH, FxU32 dstStride, void* dst) {
-    DG_LOG_STUB("grLfbReadRegion");
-    (void)buffer; (void)srcX; (void)srcY; (void)srcW; (void)srcH;
-    (void)dstStride; (void)dst;
-    return FXTRUE;
+    DG_LOG_ONCE("grLfbReadRegion");
+    (void)buffer;
+    return dg_lfb_read_region(srcX, srcY, srcW, srcH, dstStride, dst)
+        ? FXTRUE : FXFALSE;
 }
 
 FxBool __stdcall grLfbWriteRegion(GrBuffer_t buffer, FxU32 dstX, FxU32 dstY,
                                    GrLfbWriteMode_t writeMode, FxU32 srcW, FxU32 srcH,
                                    FxU32 srcStride, void* src) {
-    DG_LOG_STUB("grLfbWriteRegion");
-    (void)buffer; (void)dstX; (void)dstY; (void)writeMode;
-    (void)srcW; (void)srcH; (void)srcStride; (void)src;
-    return FXTRUE;
+    DG_LOG_ONCE("grLfbWriteRegion");
+    (void)buffer;
+    return dg_lfb_write_region(dstX, dstY, writeMode, srcW, srcH, srcStride, src)
+        ? FXTRUE : FXFALSE;
 }
 
 void __stdcall grLfbConstantAlpha(GrAlpha_t alpha) {

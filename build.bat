@@ -12,7 +12,7 @@ set CFLAGS=/nologo /c /O2 /W3 /GS- /D_CRT_SECURE_NO_WARNINGS /DWIN32 /D_WINDOWS 
 set INCLUDES=/I"src" /I"%MSVC%\include" /I"%WINSDK%\Include\%WINVER%\ucrt" /I"%WINSDK%\Include\%WINVER%\um" /I"%WINSDK%\Include\%WINVER%\shared"
 
 set SRCS=dllmain log d3d11_backend d3d11_state d3d11_texture glide_exports
-set LIBS=kernel32.lib user32.lib d3d11.lib dxgi.lib d3dcompiler.lib uuid.lib
+set LIBS=kernel32.lib user32.lib gdi32.lib d3d11.lib dxgi.lib d3dcompiler.lib uuid.lib
 
 if not exist build mkdir build
 

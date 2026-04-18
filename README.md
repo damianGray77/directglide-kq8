@@ -71,6 +71,19 @@ niceties that nGlide/dgVoodoo/real Voodoo hardware couldn't provide.
   HUD bar extents from the leftmost pixel column and preserves those
   rows across frames, while dynamic elements (cursor, dialogue) still
   wipe cleanly.
+- **Fullscreen intro/outro FMV** — WndProc subclass on the MCIWnd
+  child window plus IAT-patches on `msvfw32`'s imports of
+  `StretchDIBits`/`SetDIBitsToDevice`/`StretchBlt` intercept the video
+  playback thread's draws and redirect them to an aspect-preserved
+  letterboxed fullscreen rect. MCIWnd's own `PUT_DEST`/`SETZOOM`
+  messages are ignored on modern Windows, so we hook the underlying
+  gdi calls instead.
+- **Save-file thumbnails** — `grLfbLock(READ_ONLY)` populates the
+  returned buffer with a GPU-readback of the current `gameTex` so
+  KQ8 can capture a real thumbnail of the current 3D scene when
+  saving. `grLfbWriteRegion` blits saved thumbnails back for the
+  save/load screen. Pre-fix, both paths silently returned the
+  wrapper's canary buffer → every thumbnail slot was colorful static.
 - **NVIDIA GPU selection** — enumerates DXGI adapters and picks the
   discrete GPU over integrated when available.
 
@@ -134,18 +147,28 @@ EXE), edit `src/log.c` and change `DG_LOG_ENABLED` to `1`, then rebuild.
   could misclassify it.
 - **No AA draw variants / line drawing**. `grDrawLine`, `grDrawPoint`
   and `grAA*` are routed through the triangle path.
-- **Intro/outro FMV quirks**. KQ8's intro and ending movies are Indeo 5
+- **Intro/outro FMV codec**. KQ8's intro and ending movies are Indeo 5
   encoded AVIs (`W32opn_1.dll`, `W32ndg_1.dll`, `W32mdl_1.dll`) —
   Windows 10/11 has dropped the Indeo codec. Users can re-encode to
   Cinepak with ffmpeg:
   ```
   ffmpeg -i W32opn_1.bak.dll -c:v cinepak -q:v 5 -c:a pcm_s16le -f avi W32opn_1.dll
   ```
-  Even after re-encoding, the "Replay Intro" menu option requires
-  **two clicks** (first click puts game into fullscreen / mode-switch
-  state, second click plays the video) and the video window is not
-  stretched to full screen. These are KQ8 engine quirks on modern
-  Windows, not DirectGlide issues.
+  The "Replay Intro" menu option also requires **two clicks** on
+  modern Windows (first click puts the game into a fullscreen /
+  mode-switch state, second click plays the video) — that's a KQ8
+  engine quirk, not a DirectGlide issue. Once the video does play,
+  DirectGlide handles the fullscreen stretch.
+- **Pitch-black shadow decals**. KQ8 draws shadow polygons via blend
+  `(ZERO, SRC_COLOR)` with a near-black source texture. Because our
+  alpha-combiner pipeline emits low alpha for pixels that should be
+  fully opaque, we currently map `GR_BLEND_SRC_ALPHA` to
+  `D3D11_BLEND_ONE` as a workaround that keeps regular geometry
+  looking right. The side-effect is that legitimate multiplicative
+  shadow decals render as pure-black rectangles instead of subtle
+  darkening. A proper fix requires auditing the alpha combiner to
+  match the Glide 2.x spec — see `mapBlend()` in
+  `src/d3d11_backend.c`.
 
 ---
 

@@ -138,4 +138,12 @@ void* dg_lfb_lock(GrLfbWriteMode_t writeMode, FxU32* outStride);
 void  dg_lfb_unlock(void);
 void  dg_lfb_flush(void);
 
+/* Direct region read/write — used for save-file thumbnail capture (Read)
+ * and save-screen thumbnail display (Write). Returns 1 on success, 0 on
+ * failure. Coordinates are in game-space (640x480), RGB565 pixel format. */
+int   dg_lfb_read_region(FxU32 srcX, FxU32 srcY, FxU32 srcW, FxU32 srcH,
+                          FxU32 dstStride, void* dst);
+int   dg_lfb_write_region(FxU32 dstX, FxU32 dstY, GrLfbWriteMode_t writeMode,
+                           FxU32 srcW, FxU32 srcH, FxU32 srcStride, const void* src);
+
 #endif /* DG_D3D11_BACKEND_H */
