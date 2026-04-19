@@ -376,6 +376,21 @@ static void lfbFillCanary(FxU8* buf, FxU32 strideBytes, int w, int h) {
     }
 }
 
+/* Symmetric-rounded screen->game translation. Round-trip-stable with
+ * gameToScreen below — essential for mouse-look, where the game does
+ * SetCursorPos(center) → GetCursorPos → delta → SetCursorPos(center)
+ * in a tight loop. With plain integer-division (floor), non-integer
+ * letterbox scaling produces a 1-pixel round-trip error every cycle,
+ * which the camera interprets as continuous rotation input. */
+static int screenXToGameX(int winX, int destX, int destW) {
+    long num = ((long)winX - destX) * (long)g_dg.width + destW / 2;
+    return (int)(num / destW);
+}
+static int screenYToGameY(int winY, int destY, int destH) {
+    long num = ((long)winY - destY) * (long)g_dg.height + destH / 2;
+    return (int)(num / destH);
+}
+
 /* Translate screen-space mouse (window-client) coords to game coords (640x480) */
 static LPARAM translateMouseLParam(LPARAM lParam) {
     int destX, destY, destW, destH;
@@ -384,8 +399,8 @@ static LPARAM translateMouseLParam(LPARAM lParam) {
     int gameX, gameY;
     getGameRect(&destX, &destY, &destW, &destH);
     if (destW == 0 || destH == 0) return lParam;
-    gameX = (int)(((long)winX - destX) * (long)g_dg.width / (long)destW);
-    gameY = (int)(((long)winY - destY) * (long)g_dg.height / (long)destH);
+    gameX = screenXToGameX(winX, destX, destW);
+    gameY = screenYToGameY(winY, destY, destH);
     /* Minimum gameX = 1, not 0. The LFB-flush HUD-detection hack probes the
      * leftmost pixel column (x=0) to identify HUD bar extents; the cursor is
      * the only game element that could reach x=0, so we keep it one pixel in. */
@@ -894,12 +909,13 @@ static HWND WINAPI hookedCreateWindowExA(DWORD exStyle, LPCSTR className, LPCSTR
     return rc;
 }
 
-/* Translate game coords -> screen coords */
+/* Translate game coords -> screen coords. Symmetric rounding pairs
+ * with screenXToGameX/screenYToGameY so round-trip is stable. */
 static void gameToScreen(int gx, int gy, int* sx, int* sy) {
     int destX, destY, destW, destH;
     getGameRect(&destX, &destY, &destW, &destH);
-    *sx = destX + gx * destW / g_dg.width;
-    *sy = destY + gy * destH / g_dg.height;
+    *sx = destX + (gx * destW + g_dg.width  / 2) / g_dg.width;
+    *sy = destY + (gy * destH + g_dg.height / 2) / g_dg.height;
 }
 
 static BOOL WINAPI hookedSetCursorPos(int x, int y) {
@@ -908,6 +924,13 @@ static BOOL WINAPI hookedSetCursorPos(int x, int y) {
     {
         int sx, sy;
         gameToScreen(x, y, &sx, &sy);
+        {
+            static int s_last_gx = -1, s_last_gy = -1;
+            if (x != s_last_gx || y != s_last_gy) {
+                dg_log("SetCursorPos: game=(%d,%d) -> screen=(%d,%d)\n", x, y, sx, sy);
+                s_last_gx = x; s_last_gy = y;
+            }
+        }
         if (s_origSetCursorPos) return s_origSetCursorPos(sx, sy);
         return SetCursorPos(sx, sy);
     }
@@ -922,6 +945,15 @@ static BOOL WINAPI hookedClipCursor(const RECT* r) {
         gameToScreen(r->left, r->top, &x0, &y0);
         gameToScreen(r->right, r->bottom, &x1, &y1);
         sr.left = x0; sr.top = y0; sr.right = x1; sr.bottom = y1;
+        {
+            static RECT s_lastGame = {0};
+            if (r->left != s_lastGame.left || r->top != s_lastGame.top ||
+                r->right != s_lastGame.right || r->bottom != s_lastGame.bottom) {
+                dg_log("ClipCursor: game=(%d,%d)-(%d,%d) -> screen=(%d,%d)-(%d,%d)\n",
+                       r->left, r->top, r->right, r->bottom, x0, y0, x1, y1);
+                s_lastGame = *r;
+            }
+        }
         return s_origClipCursor ? s_origClipCursor(&sr) : ClipCursor(&sr);
     }
 }
@@ -936,17 +968,13 @@ static BOOL WINAPI hookedGetCursorPos(LPPOINT pt) {
         ScreenToClient(g_dg.hwnd, &winPt);
         getGameRect(&destX, &destY, &destW, &destH);
         if (destW > 0 && destH > 0) {
-            long gx = ((long)winPt.x - destX) * (long)g_dg.width / (long)destW;
-            long gy = ((long)winPt.y - destY) * (long)g_dg.height / (long)destH;
+            int gx = screenXToGameX(winPt.x, destX, destW);
+            int gy = screenYToGameY(winPt.y, destY, destH);
             /* Clamp minimum x to 1 (not 0) — see translateMouseLParam comment. */
-            if (gx < 1) gx = 1; else if (gx >= g_dg.width) gx = g_dg.width - 1;
+            if (gx < 1) gx = 1; else if (gx >= g_dg.width)  gx = g_dg.width - 1;
             if (gy < 0) gy = 0; else if (gy >= g_dg.height) gy = g_dg.height - 1;
-            /* Rewrite to game coords in SCREEN space — the client window is at (0,0) of screen */
-            POINT client = { (LONG)gx, (LONG)gy };
-            ClientToScreen(g_dg.hwnd, &client);
-            /* Actually the game uses these as-is, so return client coords directly */
-            pt->x = (LONG)gx;
-            pt->y = (LONG)gy;
+            pt->x = gx;
+            pt->y = gy;
         }
     }
     return result;
@@ -1865,10 +1893,24 @@ void dg_draw_triangle(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
             if (srv == NULL && drawCount > 10 && g_rs.texSourceAddr[0] != 0) {
                 static int missCount = 0;
                 static FxU32 lastMissAddr = 0;
-                if (g_rs.texSourceAddr[0] != lastMissAddr && missCount < 20) {
-                    dg_log("  TEX MISS: draw #%d wants addr=0x%X (unique miss #%d)\n",
-                           drawCount, g_rs.texSourceAddr[0], missCount);
-                    lastMissAddr = g_rs.texSourceAddr[0];
+                if (g_rs.texSourceAddr[0] != lastMissAddr && missCount < 30) {
+                    FxU32 wantAddr = g_rs.texSourceAddr[0];
+                    FxU32 nearAddr = 0, nearEnd = 0;
+                    int nearW = 0, nearH = 0, nearBpp = 0;
+                    if (dg_tex_find_nearest_before(wantAddr, &nearAddr,
+                                                    &nearW, &nearH,
+                                                    &nearBpp, &nearEnd)) {
+                        int inside = (wantAddr >= nearAddr && wantAddr < nearEnd);
+                        dg_log("  TEX MISS #%d draw #%d wants=0x%X | nearest=0x%X %dx%d bpp=%d end=0x%X offset=+%d %s\n",
+                               missCount, drawCount, wantAddr,
+                               nearAddr, nearW, nearH, nearBpp, nearEnd,
+                               (int)(wantAddr - nearAddr),
+                               inside ? "INSIDE-RANGE" : "outside");
+                    } else {
+                        dg_log("  TEX MISS #%d draw #%d wants=0x%X (no prior cache entry)\n",
+                               missCount, drawCount, wantAddr);
+                    }
+                    lastMissAddr = wantAddr;
                     missCount++;
                 }
             }
@@ -1926,6 +1968,7 @@ void dg_d3d11_present(int swapInterval) {
      * detected without color collisions with game-written content. */
     if (g_dg.drewThisFrame && g_dg.lfbLockedThisFrame && g_dg.lfbCpuBuffer) {
         lfbFillCanary(g_dg.lfbCpuBuffer, (FxU32)(g_dg.width * 2), g_dg.width, g_dg.height);
+        g_dg.lfbNeedsPopulate = 1;
     }
     g_dg.lfbLockedThisFrame = 0;
     g_dg.drewThisFrame = 0;
@@ -1949,12 +1992,13 @@ void dg_d3d11_clear(float r, float g, float b, float a, float depth) {
      * game colors (e.g. KQ8 uses magenta 0xF81F as a "no save preview" color). */
     if (g_dg.lfbCpuBuffer) {
         lfbFillCanary(g_dg.lfbCpuBuffer, (FxU32)(g_dg.width * 2), g_dg.width, g_dg.height);
+        g_dg.lfbNeedsPopulate = 1;
     }
-    /* Also clear the HUD stable buffer — scene transitions should dump accumulated
-     * HUD overlays (see dg_lfb_flush for what lfbStable is). */
-    if (g_dg.lfbStable) {
-        memset(g_dg.lfbStable, 0, g_dg.width * g_dg.height * 4);
-    }
+    /* Intentionally do NOT wipe lfbStable here. KQ8 calls grBufferClear
+     * every frame, so wiping stable would defeat cross-frame persistence
+     * for HUD elements that are drawn once (XP bar, HP bar, crest). The
+     * trade-off: transient content that lands inside the extended HUD
+     * zone will leave residue until overwritten by new HUD writes. */
 }
 
 /* ============================================================
@@ -1974,6 +2018,9 @@ static int createLfbResources(void) {
     /* HUD stable buffer — see dg_lfb_flush for what this is and why it exists. */
     g_dg.lfbStable = (FxU32*)calloc(1, g_dg.width * g_dg.height * 4);
     if (!g_dg.lfbStable) return 0;
+
+    /* Mark LFB as needing population on the first Lock of the session. */
+    g_dg.lfbNeedsPopulate = 1;
 
     memset(&td, 0, sizeof(td));
     td.Width = (UINT)g_dg.width;
@@ -2180,7 +2227,6 @@ void dg_lfb_flush(void) {
 
     if (!g_dg.isOpen || !g_dg.lfbDirty || !g_dg.lfbCpuBuffer) return;
 
-    dg_log("  lfb_flush: mapping texture\n");
     hr = ID3D11DeviceContext_Map(g_dg.context, (ID3D11Resource*)g_dg.lfbTexture,
                                  0, D3D11_MAP_WRITE_DISCARD, 0, &mapped);
     if (FAILED(hr)) { dg_log("  lfb_flush: Map failed 0x%08X\n", hr); return; }
@@ -2204,81 +2250,33 @@ void dg_lfb_flush(void) {
              * sentinel → transparent → 3D shows through (often black at night).
              * End result: XP bar flickers out and stays missing.
              *
-             * We can't distinguish "game didn't redraw because it's static" from
-             * "game didn't redraw because it's gone" at the pixel level without
-             * more info from the game. But KQ8 has a convenient structural property:
+             * Canary is the sentinel for "game never wrote this pixel" — on
+             * composite, canary pixels become transparent so the 3D scene
+             * shows through; any other value is output as an opaque written
+             * pixel. KQ8 uses 0xF81F magenta itself as a "no save preview"
+             * placeholder, which is why the canary is position-dependent
+             * rather than a fixed value.
              *
-             *   The HUD bars (top and bottom) span the full screen width, AND
-             *   nothing ever renders at x=0 *except* those HUD bars. Dynamic
-             *   elements (cursor, dialogue modals, subtitles) always appear
-             *   somewhere in the interior of the screen.
-             *
-             * We probe the LEFTMOST and RIGHTMOST columns each flush. A row
-             * is classified as HUD only if BOTH edges are non-canary — i.e. a
-             * bar spans the full width. Partial overlays (e.g. KQ8's map which
-             * slides in from the left side only) won't match both criteria and
-             * are handled as normal 3D-viewport rows.
-             *
-             * For HUD rows, we accumulate written pixels into `lfbStable` — a
-             * persistent buffer reset only on grBufferClear — and composite
-             * from that, so static overlays (XP bar, icon decorations) survive
-             * even when the game doesn't redraw them every frame.
-             *
-             * "Unwritten" pixels are detected via a position-dependent canary
-             * instead of a fixed magenta sentinel, avoiding color collisions
-             * (KQ8 uses 0xF81F itself as a "no save preview" placeholder).
+             * (This wrapper previously implemented a dual-edge HUD probe +
+             * stable-buffer persistence hack to try to survive HUD elements
+             * the game draws only once. It failed for KQ8's XP bar and
+             * introduced smearing in enough edge cases that we reverted to
+             * the simple one. Tracked as a known limitation.)
              * ----------------------------------------------------------------------- */
             int is3dFrame = g_dg.drewThisFrame;
-            int topHudBottom = 0;    /* HUD occupies y < topHudBottom */
-            int bottomHudTop = g_dg.height; /* HUD occupies y >= bottomHudTop */
-            int lastX = g_dg.width - 1;
-
-            /* Probe both edges; row only counts as HUD if both sides are non-canary */
-            for (y = 0; y < g_dg.height; y++) {
-                FxU16* row = (FxU16*)(src + y * g_dg.lfbStride);
-                int leftWritten  = (row[0]     != lfbCanary(0,     y));
-                int rightWritten = (row[lastX] != lfbCanary(lastX, y));
-                if (!(leftWritten && rightWritten)) break;
-                topHudBottom = y + 1;
-            }
-            for (y = g_dg.height - 1; y >= 0; y--) {
-                FxU16* row = (FxU16*)(src + y * g_dg.lfbStride);
-                int leftWritten  = (row[0]     != lfbCanary(0,     y));
-                int rightWritten = (row[lastX] != lfbCanary(lastX, y));
-                if (!(leftWritten && rightWritten)) break;
-                bottomHudTop = y;
-            }
 
             for (y = 0; y < g_dg.height; y++) {
                 FxU32* dstRow = (FxU32*)(dst + y * mapped.RowPitch);
                 FxU16* srcRow = (FxU16*)(src + y * g_dg.lfbStride);
-                int inHud = (y < topHudBottom) || (y >= bottomHudTop);
-
-                if (inHud) {
-                    /* HUD row: merge written pixels into stable, output stable. */
-                    FxU32* stableRow = g_dg.lfbStable + y * g_dg.width;
-                    for (x = 0; x < g_dg.width; x++) {
-                        FxU16 c = srcRow[x];
-                        if (c != lfbCanary(x, y)) {
-                            FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
-                            FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
-                            FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
-                            stableRow[x] = 0xFF000000 | ((FxU32)b << 16) | ((FxU32)g << 8) | r;
-                        }
-                        dstRow[x] = stableRow[x];
-                    }
-                } else {
-                    /* Viewport / partial-overlay row: no persistence. */
-                    for (x = 0; x < g_dg.width; x++) {
-                        FxU16 c = srcRow[x];
-                        if (c == lfbCanary(x, y)) {
-                            dstRow[x] = is3dFrame ? 0x00000000 : 0xFF000000;
-                        } else {
-                            FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
-                            FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
-                            FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
-                            dstRow[x] = 0xFF000000 | ((FxU32)b << 16) | ((FxU32)g << 8) | r;
-                        }
+                for (x = 0; x < g_dg.width; x++) {
+                    FxU16 c = srcRow[x];
+                    if (c == lfbCanary(x, y)) {
+                        dstRow[x] = is3dFrame ? 0x00000000 : 0xFF000000;
+                    } else {
+                        FxU8 r = (FxU8)(((c >> 11) & 0x1F) * 255 / 31);
+                        FxU8 g = (FxU8)(((c >> 5)  & 0x3F) * 255 / 63);
+                        FxU8 b = (FxU8)(( c        & 0x1F) * 255 / 31);
+                        dstRow[x] = 0xFF000000 | ((FxU32)b << 16) | ((FxU32)g << 8) | r;
                     }
                 }
             }
@@ -2286,7 +2284,6 @@ void dg_lfb_flush(void) {
     }
 
     ID3D11DeviceContext_Unmap(g_dg.context, (ID3D11Resource*)g_dg.lfbTexture, 0);
-    dg_log("  lfb_flush: drawing quad\n");
 
     /* LFB blits onto the AA'd (post-FXAA) buffer so the HUD stays sharp —
      * final sharp-bilinear upscale to screen happens next in blitGameToScreen. */
@@ -2299,7 +2296,6 @@ void dg_lfb_flush(void) {
     ID3D11DeviceContext_PSSetShaderResources(g_dg.context, 0, 1, &g_dg.lfbSRV);
     ID3D11DeviceContext_PSSetSamplers(g_dg.context, 0, 1, &g_dg.lfbSampler);
     ID3D11DeviceContext_Draw(g_dg.context, 3, 0);
-    dg_log("  lfb_flush: done\n");
     g_dg.lfbDirty = 0;
 }
 

@@ -100,6 +100,12 @@ typedef struct {
      * extents; non-sentinel pixels inside those rows accumulate here and are
      * displayed in the HUD rows regardless of whether the game redraws them. */
     FxU32*                  lfbStable;      /* width*height RGBA8, zero = transparent */
+    /* Set to 1 after the LFB buffer is canary-wiped (grBufferClear or
+     * post-present). First Lock of the frame populates the buffer from
+     * gameTex (matches Voodoo hardware returning current framebuffer via
+     * LFB) and clears this flag. Subsequent locks within the same frame
+     * skip populate so they don't wipe accumulated game writes. */
+    int                     lfbNeedsPopulate;
     FxU8*                   lfbCpuBuffer;
     int                     lfbDirty;
     int                     lfbLockedThisFrame;  /* Was LFB locked since last present? */

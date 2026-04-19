@@ -10,7 +10,7 @@
 #include <windows.h>
 
 #ifndef DG_LOG_ENABLED
-#define DG_LOG_ENABLED 0
+#define DG_LOG_ENABLED 1   /* temp: crash hunt */
 #endif
 
 #if DG_LOG_ENABLED

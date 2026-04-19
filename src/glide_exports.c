@@ -57,14 +57,58 @@ void __stdcall grGlideGetVersion(char* version) {
     if (version) strcpy(version, "2.4");
 }
 
+/* grGlideGetState/SetState: snapshot and restore the full render state.
+ *
+ * The caller allocates a `GrState` buffer whose size depends on the
+ * Glide header version the game was compiled against — older headers
+ * allocated as little as 256 bytes. Our DGRenderState is ~400 bytes,
+ * so a naive memcpy into the caller's buffer overflows and smashes
+ * the caller's stack.
+ *
+ * Instead we keep the saved state inside the DLL in a small slot pool
+ * and write only an 8-byte token into the caller's buffer. This fits
+ * safely in any plausible GrState size. */
+#define DG_GRSTATE_MAGIC 0xD61DE57Au   /* "DirectGlide State" */
+#define DG_GRSTATE_SLOTS 32
+static DGRenderState s_savedStates[DG_GRSTATE_SLOTS];
+static int s_savedStatesCount = 0;
+
 void __stdcall grGlideGetState(GrState* state) {
-    DG_LOG_STUB("grGlideGetState");
-    if (state) memset(state, 0, sizeof(GrState));
+    DG_LOG_ONCE("grGlideGetState");
+    if (!state) return;
+    /* Pick a slot. Games typically nest Get/Set; we'll wrap around if
+     * they exceed DG_GRSTATE_SLOTS simultaneous snapshots. */
+    {
+        int slot = s_savedStatesCount++ % DG_GRSTATE_SLOTS;
+        FxU32* p = (FxU32*)state;
+        s_savedStates[slot] = g_rs;
+        p[0] = DG_GRSTATE_MAGIC;
+        p[1] = (FxU32)slot;
+    }
 }
 
 void __stdcall grGlideSetState(const GrState* state) {
-    DG_LOG_STUB("grGlideSetState");
-    (void)state;
+    DG_LOG_ONCE("grGlideSetState");
+    if (!state) return;
+    {
+        const FxU32* p = (const FxU32*)state;
+        if (p[0] == DG_GRSTATE_MAGIC) {
+            int slot = (int)p[1];
+            if (slot >= 0 && slot < DG_GRSTATE_SLOTS) {
+                g_rs = s_savedStates[slot];
+            }
+        }
+        /* else: buffer wasn't written by our Get — treat as no-op rather
+         * than reading arbitrary memory. */
+    }
+    /* Force D3D state to re-upload next frame. */
+    g_rs.combinerDirty  = 1;
+    g_rs.blendDirty     = 1;
+    g_rs.depthDirty     = 1;
+    g_rs.rasterDirty    = 1;
+    g_rs.samplerDirty   = 1;
+    g_rs.textureDirty   = 1;
+    g_rs.fogTableDirty  = 1;
 }
 
 void __stdcall grGlideShamelessPlug(FxBool on) {
@@ -139,30 +183,36 @@ FxBool __stdcall grSstControl(FxU32 code) {
 }
 
 void __stdcall grSstIdle(void) {
-    /* no-op: we're never busy */
+    DG_LOG_ONCE("grSstIdle");
 }
 
 FxBool __stdcall grSstIsBusy(void) {
+    DG_LOG_ONCE("grSstIsBusy");
     return FXFALSE;
 }
 
 FxU32 __stdcall grSstStatus(void) {
-    return 0x0FFFF43F; /* Voodoo2-like status bits */
+    DG_LOG_ONCE("grSstStatus");
+    return 0x0FFFF43F;
 }
 
 FxBool __stdcall grSstVRetraceOn(void) {
+    DG_LOG_ONCE("grSstVRetraceOn");
     return FXTRUE;
 }
 
 FxU32 __stdcall grSstVideoLine(void) {
+    DG_LOG_ONCE("grSstVideoLine");
     return 0;
 }
 
 FxU32 __stdcall grSstScreenWidth(void) {
+    DG_LOG_ONCE("grSstScreenWidth");
     return (FxU32)g_width;
 }
 
 FxU32 __stdcall grSstScreenHeight(void) {
+    DG_LOG_ONCE("grSstScreenHeight");
     return (FxU32)g_height;
 }
 
@@ -225,6 +275,7 @@ void __stdcall grBufferSwap(FxU32 swapInterval) {
 }
 
 int __stdcall grBufferNumPending(void) {
+    DG_LOG_ONCE("grBufferNumPending");
     return 0;
 }
 
@@ -342,26 +393,11 @@ void __stdcall grFogColorValue(GrColor_t color) {
     g_rs.combiner.fogB = (float)( color        & 0xFF) / 255.0f;
     g_rs.combiner.fogA = (float)((color >> 24) & 0xFF) / 255.0f;
     g_rs.combinerDirty = 1;
-    {
-        static FxU32 lastColor = 0xFFFFFFFF;
-        if (color != lastColor) {
-            dg_log("grFogColorValue: 0x%08X (R=%.2f G=%.2f B=%.2f)\n",
-                   color, g_rs.combiner.fogR, g_rs.combiner.fogG, g_rs.combiner.fogB);
-            lastColor = color;
-        }
-    }
 }
 
 void __stdcall grFogMode(GrFogMode_t mode) {
     g_rs.combiner.fogMode = mode;
     g_rs.combinerDirty = 1;
-    {
-        static int lastMode = -1;
-        if ((int)mode != lastMode) {
-            dg_log("grFogMode: %d\n", mode);
-            lastMode = mode;
-        }
-    }
 }
 
 void __stdcall grFogTable(const GrFog_t* table) {
@@ -388,11 +424,21 @@ void __stdcall grGammaCorrectionValue(float value) {
 }
 
 void __stdcall grChromakeyMode(GrChromakeyMode_t mode) {
+    static int lastMode = -1;
+    if ((int)mode != lastMode) {
+        dg_log("grChromakeyMode: %d\n", mode);
+        lastMode = mode;
+    }
     g_rs.combiner.chromakeyEnable = mode;
     g_rs.combinerDirty = 1;
 }
 
 void __stdcall grChromakeyValue(GrColor_t value) {
+    static GrColor_t lastValue = 0xFFFFFFFF;
+    if (value != lastValue) {
+        dg_log("grChromakeyValue: 0x%08X\n", value);
+        lastValue = value;
+    }
     g_rs.combiner.chromaR = (float)((value >> 16) & 0xFF) / 255.0f;
     g_rs.combiner.chromaG = (float)((value >> 8)  & 0xFF) / 255.0f;
     g_rs.combiner.chromaB = (float)( value        & 0xFF) / 255.0f;
@@ -466,17 +512,20 @@ void __stdcall grAADrawPolygonVertexList(int nVerts, const GrVertex* verts) {
  * ============================================================ */
 
 FxU32 __stdcall grTexMinAddress(GrChipID_t tmu) {
+    DG_LOG_ONCE("grTexMinAddress");
     (void)tmu;
     return TEX_MEM_BASE;
 }
 
 FxU32 __stdcall grTexMaxAddress(GrChipID_t tmu) {
+    DG_LOG_ONCE("grTexMaxAddress");
     (void)tmu;
     return TEX_MEM_BASE + TEX_MEM_SIZE - 1;
 }
 
 FxU32 __stdcall grTexCalcMemRequired(GrLOD_t smallLod, GrLOD_t largeLod,
                                       GrAspectRatio_t aspect, GrTextureFormat_t fmt) {
+    DG_LOG_ONCE("grTexCalcMemRequired");
     /* Rough size estimate based on format and LOD range */
     int maxDim = 256 >> smallLod; /* smallest mip dimension */
     int topDim = 256 >> largeLod; /* largest mip dimension */
@@ -491,6 +540,7 @@ FxU32 __stdcall grTexCalcMemRequired(GrLOD_t smallLod, GrLOD_t largeLod,
 }
 
 FxU32 __stdcall grTexTextureMemRequired(FxU32 oddEven, GrTexInfo* info) {
+    DG_LOG_ONCE("grTexTextureMemRequired");
     (void)oddEven;
     if (!info) return 256;
     return grTexCalcMemRequired(info->smallLod, info->largeLod, info->aspectRatio, info->format);
@@ -626,6 +676,7 @@ void __stdcall grTexMultibaseAddress(GrChipID_t tmu, FxU32 range, FxU32 startAdd
 }
 
 FxBool __stdcall grCheckForRoom(FxI32 n) {
+    DG_LOG_ONCE("grCheckForRoom");
     (void)n;
     return FXTRUE;
 }
@@ -639,19 +690,29 @@ FxBool __stdcall grLfbLock(GrLock_t type, GrBuffer_t buffer,
                             FxBool pixelPipeline, GrLfbInfo_t* info) {
     FxU32 stride = 0;
     void* ptr;
-    DG_LOG_ONCE("grLfbLock");
-    (void)buffer; (void)origin; (void)pixelPipeline;
+    {
+        static int lastType = -1;
+        static int lastBuffer = -1;
+        if ((int)type != lastType || (int)buffer != lastBuffer) {
+            dg_log("grLfbLock: type=0x%X buffer=%d writeMode=%d pxPipe=%d\n",
+                   type, buffer, writeMode, pixelPipeline);
+            lastType = (int)type;
+            lastBuffer = (int)buffer;
+        }
+    }
+    (void)origin;
 
     ptr = dg_lfb_lock(writeMode, &stride);
     if (!ptr) return FXFALSE;
 
-    /* If game wants to READ the framebuffer (e.g., to capture a save-file
-     * thumbnail of the current 3D scene), populate the buffer with current
-     * gameTex contents as RGB565. Without this, the game reads our canary
-     * pattern and stores garbage in the save file. */
-    if ((type & GR_LFB_WRITE_ONLY) == 0) {
+    /* Populate LFB from gameTex only on READ locks (e.g., save thumbnail
+     * capture). WRITE locks get the canary-filled buffer untouched, so
+     * the game's HUD writes remain distinguishable from "not written"
+     * and our stable-buffer persistence works correctly. */
+    if ((type & GR_LFB_WRITE_ONLY) == 0 && g_dg.lfbNeedsPopulate) {
         dg_lfb_read_region(0, 0, (FxU32)g_dg.width, (FxU32)g_dg.height,
                             (FxU32)(g_dg.width * 2), ptr);
+        g_dg.lfbNeedsPopulate = 0;
     }
 
     if (info) {
@@ -667,6 +728,34 @@ FxBool __stdcall grLfbLock(GrLock_t type, GrBuffer_t buffer,
 FxBool __stdcall grLfbUnlock(GrLock_t type, GrBuffer_t buffer) {
     DG_LOG_ONCE("grLfbUnlock");
     (void)type; (void)buffer;
+
+    /* DIAGNOSTIC: sample pixel values from different regions to see what
+     * the game is writing where. If 3D viewport is "transparent marker"
+     * we'd see a single repeated color; if it's real rendered content
+     * we'd see variation. */
+    if (g_dg.lfbCpuBuffer && g_dg.lfbStride > 0) {
+        static unsigned s_sampleCount = 0;
+        if (s_sampleCount < 6) {
+            int y, x;
+            int W = g_dg.width, H = g_dg.height;
+            FxU16* row;
+            dg_log("UNLOCK SAMPLE #%u:\n", s_sampleCount);
+            /* Top row, middle, bottom — sample 5 pixels across each */
+            for (y = 0; y < H; y += (H - 1) > 0 ? H / 4 : 1) {
+                if (y >= H) y = H - 1;
+                row = (FxU16*)(g_dg.lfbCpuBuffer + y * g_dg.lfbStride);
+                dg_log("  y=%d: ", y);
+                for (x = 0; x < W; x += W / 7) {
+                    if (x >= W) break;
+                    dg_log(" x=%d:0x%04X", x, row[x]);
+                }
+                dg_log("\n");
+                if (y == H - 1) break;
+            }
+            s_sampleCount++;
+        }
+    }
+
     dg_lfb_unlock();
     return FXTRUE;
 }
@@ -715,6 +804,7 @@ void __stdcall grResetTriStats(void) {
 }
 
 void __stdcall grTriStats(FxU32* trisProcessed, FxU32* trisDrawn) {
+    DG_LOG_ONCE("grTriStats");
     if (trisProcessed) *trisProcessed = 0;
     if (trisDrawn) *trisDrawn = 0;
 }
@@ -763,15 +853,25 @@ FxBool __stdcall guTexChangeAttributes(GrMipMapId_t id,
     GrAspectRatio_t aspect, GrTextureClampMode_t sClamp,
     GrTextureClampMode_t tClamp, GrTextureFilterMode_t minFilter,
     GrTextureFilterMode_t magFilter) {
-    DG_LOG_STUB("guTexChangeAttributes");
-    (void)id; (void)width; (void)height; (void)fmt;
-    (void)mmMode; (void)smallLod; (void)largeLod;
-    (void)aspect; (void)sClamp; (void)tClamp; (void)minFilter; (void)magFilter;
+    dg_log("CALL: guTexChangeAttributes(id=%d %dx%d fmt=%d)\n", id, width, height, fmt);
+    (void)width; (void)height;   /* derived from aspect+largeLod at download time */
+    /* Our GrTexInfo only stores lod/aspect/format/data — clamp, filter and
+     * mipmap mode are per-TMU state applied when the mipmap is bound. */
+    (void)mmMode; (void)sClamp; (void)tClamp; (void)minFilter; (void)magFilter;
+    if (id < 0 || id >= g_mipmapCount) return FXFALSE;
+    {
+        GrMipMapInfo* mm = &g_mipmaps[id];
+        mm->info.smallLod    = smallLod;
+        mm->info.largeLod    = largeLod;
+        mm->info.aspectRatio = aspect;
+        mm->info.format      = fmt;
+    }
     return FXTRUE;
 }
 
 void __stdcall guTexCombineFunction(GrChipID_t tmu, FxI32 func) {
     dg_log("CALL: guTexCombineFunction(tmu=%d, func=%d)\n", tmu, func);
+    grTexCombineFunction(tmu, func);
 }
 
 void __stdcall guTexDownloadMipMap(GrMipMapId_t id, const void* src, const void* nccTable) {
@@ -815,6 +915,13 @@ void __stdcall guTexMemReset(void) {
     g_mipmapCount = 0;
     g_texAllocPtr[0] = TEX_MEM_BASE;
     g_texAllocPtr[1] = TEX_MEM_BASE;
+    /* CRITICAL: the game is saying "all my previous texture allocations
+     * are gone, starting over". If we keep our cache, future uploads at
+     * reused addresses will replace one entry, but addresses the game
+     * doesn't revisit retain stale content and the cache grows forever —
+     * eventually hitting >100k entries and triggering texture-miss
+     * cascades. Matching semantics means flushing our cache too. */
+    dg_tex_invalidate_all();
 }
 
 void __stdcall guTexSource(GrMipMapId_t id) {
@@ -825,12 +932,108 @@ void __stdcall guTexSource(GrMipMapId_t id) {
     }
 }
 
+/* guAlphaSource: preset helper that maps a single "alpha source" enum to
+ * a full grAlphaCombine() call. KQ8 likely uses this rather than the
+ * low-level grAlphaCombine setter for most alpha state changes. */
 void __stdcall guAlphaSource(FxI32 mode) {
     dg_log("CALL: guAlphaSource(%d)\n", mode);
+    switch (mode) {
+        case GR_ALPHASOURCE_CC_ALPHA:
+            grAlphaCombine(GR_COMBINE_FUNCTION_LOCAL, GR_COMBINE_FACTOR_ZERO,
+                           GR_COMBINE_LOCAL_CONSTANT, GR_COMBINE_OTHER_CONSTANT, FXFALSE);
+            break;
+        case GR_ALPHASOURCE_ITERATED_ALPHA:
+            grAlphaCombine(GR_COMBINE_FUNCTION_LOCAL, GR_COMBINE_FACTOR_ZERO,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_ITERATED, FXFALSE);
+            break;
+        case GR_ALPHASOURCE_TEXTURE_ALPHA:
+            grAlphaCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_ONE,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_ALPHASOURCE_TEXTURE_ALPHA_TIMES_ITERATED_ALPHA:
+            grAlphaCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_LOCAL,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        default:
+            dg_log("  guAlphaSource: unhandled mode %d\n", mode);
+            break;
+    }
 }
 
+/* guColorCombineFunction: preset helper that maps a single "color
+ * combine function" enum to a full grColorCombine() call. Mapping
+ * follows the canonical 3dfx Glide 2.x reference. */
 void __stdcall guColorCombineFunction(FxI32 func) {
     dg_log("CALL: guColorCombineFunction(%d)\n", func);
+    switch (func) {
+        case GR_COLORCOMBINE_ZERO:
+            grColorCombine(GR_COMBINE_FUNCTION_ZERO, GR_COMBINE_FACTOR_ZERO,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_ITERATED, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_CCRGB:
+            grColorCombine(GR_COMBINE_FUNCTION_LOCAL, GR_COMBINE_FACTOR_ZERO,
+                           GR_COMBINE_LOCAL_CONSTANT, GR_COMBINE_OTHER_CONSTANT, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_ITRGB:
+        case GR_COLORCOMBINE_ITRGB_DELTA0:   /* DELTA0 = 0 on Voodoo, treat as ITRGB */
+            grColorCombine(GR_COMBINE_FUNCTION_LOCAL, GR_COMBINE_FACTOR_ZERO,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_ITERATED, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_DECAL_TEXTURE:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_ONE,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_TIMES_CCRGB:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_LOCAL,
+                           GR_COMBINE_LOCAL_CONSTANT, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB:
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB_DELTA0:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_LOCAL,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ITRGB_ADD_ALPHA:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER_ADD_LOCAL_ALPHA, GR_COMBINE_FACTOR_LOCAL,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ALPHA:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_LOCAL_ALPHA,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_TIMES_ALPHA_ADD_ITRGB:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER_ADD_LOCAL, GR_COMBINE_FACTOR_LOCAL_ALPHA,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_ADD_ITRGB:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER_ADD_LOCAL, GR_COMBINE_FACTOR_ONE,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_TEXTURE_SUB_ITRGB:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER_MINUS_LOCAL, GR_COMBINE_FACTOR_ONE,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_TEXTURE, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_CCRGB_BLEND_ITRGB_ON_TEXALPHA:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_OTHER, GR_COMBINE_FACTOR_TEXTURE_ALPHA,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_CONSTANT, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_DIFF_SPEC_A:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_MINUS_LOCAL_ADD_LOCAL, GR_COMBINE_FACTOR_LOCAL_ALPHA,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_CONSTANT, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_DIFF_SPEC_B:
+            grColorCombine(GR_COMBINE_FUNCTION_SCALE_MINUS_LOCAL_ADD_LOCAL, GR_COMBINE_FACTOR_TEXTURE_ALPHA,
+                           GR_COMBINE_LOCAL_ITERATED, GR_COMBINE_OTHER_CONSTANT, FXFALSE);
+            break;
+        case GR_COLORCOMBINE_ONE:
+            /* Output constant white: LOCAL = CONSTANT, but game must
+             * have set constant color via grConstantColorValue(0xFFFFFFFF). */
+            grColorCombine(GR_COMBINE_FUNCTION_LOCAL, GR_COMBINE_FACTOR_ZERO,
+                           GR_COMBINE_LOCAL_CONSTANT, GR_COMBINE_OTHER_CONSTANT, FXFALSE);
+            break;
+        default:
+            dg_log("  guColorCombineFunction: unhandled func %d\n", func);
+            break;
+    }
 }
 
 /* ============================================================
@@ -849,16 +1052,25 @@ FxBool __stdcall gu3dfLoad(const char* filename, Gu3dfInfo* info) {
     return FXFALSE;
 }
 
+/* Clipped-draw variants: D3D11 clips to the viewport automatically, so
+ * these just forward to the triangle path. The "AA" and "WithClip"
+ * suffixes on Voodoo hardware triggered software prep passes we don't
+ * need. */
 void __stdcall guAADrawTriangleWithClip(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
-    (void)a; (void)b; (void)c;
-}
-
-void __stdcall guDrawPolygonVertexListWithClip(int nVerts, const GrVertex* verts) {
-    (void)nVerts; (void)verts;
+    if (a && b && c) dg_draw_triangle(a, b, c);
 }
 
 void __stdcall guDrawTriangleWithClip(const GrVertex* a, const GrVertex* b, const GrVertex* c) {
-    (void)a; (void)b; (void)c;
+    if (a && b && c) dg_draw_triangle(a, b, c);
+}
+
+void __stdcall guDrawPolygonVertexListWithClip(int nVerts, const GrVertex* verts) {
+    int i;
+    if (nVerts < 3 || !verts) return;
+    /* Fan triangulation: (v0, v[i-1], v[i]) for i in 2..n-1. */
+    for (i = 2; i < nVerts; i++) {
+        dg_draw_triangle(&verts[0], &verts[i - 1], &verts[i]);
+    }
 }
 
 FxI32 __stdcall guEncodeRLE16(void* dst, void* src, FxU32 w, FxU32 h) {
@@ -875,12 +1087,20 @@ FxU16 __stdcall guEndianSwapWords(FxU16 value) {
     return (FxU16)((value << 8) | (value >> 8));
 }
 
+/* gu* framebuffer helpers: thin wrappers over the gr* LFB region calls
+ * that default to the backbuffer and RGB565 pixel format. */
 void __stdcall guFbReadRegion(int srcX, int srcY, int w, int h, void* dst, int dstStride) {
-    (void)srcX; (void)srcY; (void)w; (void)h; (void)dst; (void)dstStride;
+    dg_log("CALL: guFbReadRegion(%d,%d %dx%d stride=%d)\n", srcX, srcY, w, h, dstStride);
+    if (srcX < 0 || srcY < 0 || w <= 0 || h <= 0 || !dst) return;
+    dg_lfb_read_region((FxU32)srcX, (FxU32)srcY, (FxU32)w, (FxU32)h,
+                        (FxU32)dstStride, dst);
 }
 
 void __stdcall guFbWriteRegion(int dstX, int dstY, int w, int h, void* src, int srcStride) {
-    (void)dstX; (void)dstY; (void)w; (void)h; (void)src; (void)srcStride;
+    dg_log("CALL: guFbWriteRegion(%d,%d %dx%d stride=%d)\n", dstX, dstY, w, h, srcStride);
+    if (dstX < 0 || dstY < 0 || w <= 0 || h <= 0 || !src) return;
+    dg_lfb_write_region((FxU32)dstX, (FxU32)dstY, GR_LFBWRITEMODE_565,
+                         (FxU32)w, (FxU32)h, (FxU32)srcStride, src);
 }
 
 /* Glide fog W lookup table — canonical values from OpenGlide's OGLFogTables.cpp.
